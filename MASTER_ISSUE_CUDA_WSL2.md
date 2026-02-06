@@ -40,8 +40,8 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 - Improve single-token generation path performance.
 
 **Sub-issues**
-- [ ] Persistent device buffers for repeated linear ops.
-- [ ] Optional CUDA stream and async memcpy for overlap.
+- [x] Persistent device buffers for repeated linear ops.
+- [x] Optional CUDA stream and async memcpy for overlap.
 - [ ] Evaluate cublasLt / fused kernels for BF16 weight paths.
 
 ### 4) Validation & Benchmarks
@@ -52,7 +52,7 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 **Sub-issues**
 - [x] Add smoke test command list (`samples/test_speech.wav`, stdin).
 - [x] Add perf harness documenting tokens/sec and first-token latency.
-- [ ] Add accuracy regression check (token diff tolerance strategy).
+- [x] Add accuracy regression check (token diff tolerance strategy).
 
 ### 5) WSL2 Productization
 **Deliverables**
@@ -60,9 +60,9 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 - Known limitations and troubleshooting matrix.
 
 **Sub-issues**
-- [ ] Document driver/toolkit version matrix known to work.
-- [ ] Add troubleshooting section (`nvidia-smi`, missing `libcublas.so`, OOM).
-- [ ] Add optional deployment recipe for real-time microphone pipeline.
+- [x] Document driver/toolkit version matrix known to work.
+- [x] Add troubleshooting section (`nvidia-smi`, missing `libcublas.so`, OOM).
+- [x] Add optional deployment recipe for real-time microphone pipeline.
 
 ## Parallel Work Plan (for multiple agents)
 - **Agent A:** Build system + docs foundation (Milestone 1 + part of 5).
