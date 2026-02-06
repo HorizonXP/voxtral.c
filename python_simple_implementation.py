@@ -278,10 +278,11 @@ def apply_rope(x, cos_f, sin_f, n_heads, head_dim, is_neox_style=False):
 # Causal Attention
 # ============================================================================
 
-def causal_attention(q, k, v, n_heads, n_kv_heads, head_dim, window, start_pos=0):
+def causal_attention(q, k, v, n_heads, n_kv_heads, head_dim, window,
+                     q_start_pos=0, kv_start_pos=0):
     """
-    q: [seq_q, n_heads*head_dim]
-    k: [seq_kv, n_kv_heads*head_dim]
+    q: [seq_q, n_heads*head_dim]         (queries at absolute positions q_start_pos + i)
+    k: [seq_kv, n_kv_heads*head_dim]     (keys   at absolute positions kv_start_pos + j)
     v: [seq_kv, n_kv_heads*head_dim]
     Returns: [seq_q, n_heads*head_dim]
     """
@@ -291,8 +292,8 @@ def causal_attention(q, k, v, n_heads, n_kv_heads, head_dim, window, start_pos=0
     orig_dtype = q.dtype
 
     # Reshape to [batch, n_heads, seq, head_dim] for scaled_dot_product_attention
-    q = q.view(seq_q, n_heads, head_dim).transpose(0, 1).unsqueeze(0)    # [1, nh, sq, hd]
-    k = k.view(seq_kv, n_kv_heads, head_dim).transpose(0, 1).unsqueeze(0)  # [1, nkv, skv, hd]
+    q = q.view(seq_q, n_heads, head_dim).transpose(0, 1).unsqueeze(0)       # [1, nh, sq, hd]
+    k = k.view(seq_kv, n_kv_heads, head_dim).transpose(0, 1).unsqueeze(0)   # [1, nkv, skv, hd]
     v = v.view(seq_kv, n_kv_heads, head_dim).transpose(0, 1).unsqueeze(0)
 
     # Expand KV heads for GQA
@@ -301,13 +302,12 @@ def causal_attention(q, k, v, n_heads, n_kv_heads, head_dim, window, start_pos=0
         v = v.repeat_interleave(gqa_ratio, dim=1)
 
     # Create causal mask with sliding window
-    # Note: scaled_dot_product_attention expects attn_mask where True = attend
-    attn_mask = torch.zeros(seq_q, seq_kv, dtype=torch.bool)
-    for i in range(seq_q):
-        qi = start_pos + i
-        for j in range(seq_kv):
-            if j <= qi and j >= qi - window + 1:
-                attn_mask[i, j] = True
+    # qi_abs: [sq, 1], kv_abs: [1, skv]
+    qi_abs = (q_start_pos + torch.arange(seq_q)).unsqueeze(1)        # [sq, 1]
+    kv_abs = (kv_start_pos + torch.arange(seq_kv)).unsqueeze(0)      # [1, skv]
+
+    # attend if kv_abs <= qi_abs AND kv_abs >= qi_abs - (window-1)
+    attn_mask = (kv_abs <= qi_abs) & (kv_abs >= (qi_abs - (window - 1)))
 
     # Use PyTorch's flash attention (if available) via scaled_dot_product_attention
     out = F.scaled_dot_product_attention(
