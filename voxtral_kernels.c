@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifdef USE_METAL
 #include "voxtral_metal.h"
@@ -57,8 +58,20 @@ void vox_copy(float *dst, const float *src, int n) {
 
 void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS && vox_cuda_matmul(C, A, B, M, K, N)) {
-        return;
+    static int logged_cuda = 0;
+    static int logged_fallback = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul(C, A, B, M, K, N)) {
+            if (!logged_cuda && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA (device=%s)\n", vox_cuda_device_name());
+                logged_cuda = 1;
+            }
+            return;
+        }
+        if (!logged_fallback && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul, falling back to CPU/BLAS\n");
+            logged_fallback = 1;
+        }
     }
 #endif
 #ifdef USE_BLAS
@@ -79,8 +92,20 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 
 void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS && vox_cuda_matmul_t(C, A, B, M, K, N)) {
-        return;
+    static int logged_cuda_t = 0;
+    static int logged_fallback_t = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul_t(C, A, B, M, K, N)) {
+            if (!logged_cuda_t && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA transpose path\n");
+                logged_cuda_t = 1;
+            }
+            return;
+        }
+        if (!logged_fallback_t && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul_t, falling back to CPU/BLAS\n");
+            logged_fallback_t = 1;
+        }
     }
 #endif
 #ifdef USE_BLAS

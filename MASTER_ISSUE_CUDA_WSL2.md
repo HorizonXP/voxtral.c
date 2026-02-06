@@ -19,9 +19,9 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 - CI or scripted build verification on Linux.
 
 **Sub-issues**
-- [ ] Add `make cuda` target and flags.
-- [ ] Add `make info` reporting for CUDA backend availability.
-- [ ] Add build troubleshooting docs for toolkit/library path issues.
+- [x] Add `make cuda` target and flags.
+- [x] Add `make info` reporting for CUDA backend availability.
+- [x] Add build troubleshooting docs for toolkit/library path issues.
 
 ### 2) Runtime CUDA Backend
 **Deliverables**
@@ -30,9 +30,9 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 - Correct CPU fallback when CUDA is unavailable.
 
 **Sub-issues**
-- [ ] Add `voxtral_cuda.{c,h}` abstraction.
-- [ ] Wire CUDA backend into `vox_matmul` and `vox_matmul_t`.
-- [ ] Add backend selection logging (`--debug`) showing CPU/BLAS/CUDA path.
+- [x] Add `voxtral_cuda.{c,h}` abstraction.
+- [x] Wire CUDA backend into `vox_matmul` and `vox_matmul_t`.
+- [x] Add backend selection logging (`--debug`) showing CPU/BLAS/CUDA path.
 
 ### 3) BF16 and Decoder Hot Path Optimization
 **Deliverables**
@@ -50,8 +50,8 @@ Enable production-ready NVIDIA CUDA acceleration for Voxtral in Ubuntu under WSL
 - Throughput and latency benchmarks on RTX 3080 Ti.
 
 **Sub-issues**
-- [ ] Add smoke test command list (`samples/test_speech.wav`, stdin).
-- [ ] Add perf harness documenting tokens/sec and first-token latency.
+- [x] Add smoke test command list (`samples/test_speech.wav`, stdin).
+- [x] Add perf harness documenting tokens/sec and first-token latency.
 - [ ] Add accuracy regression check (token diff tolerance strategy).
 
 ### 5) WSL2 Productization

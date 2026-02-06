@@ -283,7 +283,11 @@ This repository now includes a CUDA backend that uses **cuBLAS** for large matri
 
 ```bash
 make cuda
+# or if CUDA toolkit is installed elsewhere:
+make cuda CUDA_HOME=/usr/local/cuda
 ```
+
+The build now performs a preflight check for `cuda_runtime.h` under `${CUDA_HOME}/include`.
 
 ### Verify CUDA visibility in WSL2
 
@@ -292,3 +296,27 @@ nvidia-smi
 ```
 
 If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will offload large GEMMs to the GPU.
+
+
+### Recommended WSL2 versions (known-good baseline)
+
+- Windows 11 with recent NVIDIA Game Ready or Studio driver that includes WSL CUDA support.
+- Ubuntu 22.04+ in WSL2.
+- CUDA toolkit 12.x in Ubuntu (`cuda_runtime.h`, `libcudart`, `libcublas`).
+
+### Troubleshooting
+
+- `cuda_runtime.h not found`: install CUDA toolkit in Ubuntu and/or set `CUDA_HOME`.
+- `error while loading shared libraries: libcublas.so`: ensure `${CUDA_HOME}/lib64` is in linker path (or build with correct `CUDA_HOME`).
+- `nvidia-smi` fails in WSL2: update Windows NVIDIA driver and verify WSL GPU support is enabled.
+- OOM during long runs: reduce concurrent workloads and close GPU-intensive apps on host Windows.
+
+### Validation and benchmark helpers
+
+```bash
+# Build + optional smoke test
+./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav
+
+# Compare BLAS vs CUDA timing + output files
+./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+```
