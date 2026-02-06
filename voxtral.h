@@ -200,6 +200,12 @@ typedef struct {
 } vox_ctx_t;
 
 /* ========================================================================
+ * Alternative Tokens
+ * ======================================================================== */
+
+#define VOX_MAX_ALT 4
+
+/* ========================================================================
  * API Functions
  * ======================================================================== */
 
@@ -244,6 +250,19 @@ int vox_stream_finish(vox_stream_t *s);
  * pointers to token text. Pointers are valid until vox_stream_free().
  * Returns number of tokens written (0 = nothing pending). */
 int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max);
+
+/* Configure alternative token tracking.
+ * n_alt: max alternatives per position (1-VOX_MAX_ALT, default 1 = no alts).
+ * cutoff: max distance from top token (0.0-1.0). A token qualifies if
+ *         1 - prob[i]/prob[0] <= cutoff. */
+void vox_stream_set_alt(vox_stream_t *s, int n_alt, float cutoff);
+
+/* Retrieve pending tokens with alternatives. out_tokens has max_tokens * n_alt
+ * slots. For each token position, n_alt consecutive entries: [0]=best, rest=
+ * alternatives or NULL. n_alt is clamped to VOX_MAX_ALT.
+ * Returns number of token positions dequeued. */
+int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
+                       int max_tokens, int n_alt);
 
 /* Set minimum time between encoder runs, in seconds.
  * Lower = more responsive streaming (higher GPU overhead).

@@ -25,6 +25,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --stdin     Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>   Encoder processing interval in seconds (default: 2.0)\n");
+    fprintf(stderr, "  --alt <c>   Show alternative tokens within cutoff distance (0.0-1.0)\n");
     fprintf(stderr, "  --debug     Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent    No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h          Show this help\n");
@@ -32,19 +33,63 @@ static void usage(const char *prog) {
 
 /* Drain pending tokens from stream and print to stdout */
 static int first_token = 1;
+static float alt_cutoff = -1; /* <0 means disabled */
+
 static void drain_tokens(vox_stream_t *s) {
-    const char *tokens[64];
-    int n;
-    while ((n = vox_stream_get(s, tokens, 64)) > 0) {
-        for (int i = 0; i < n; i++) {
-            const char *t = tokens[i];
-            if (first_token) {
-                while (*t == ' ') t++;
-                first_token = 0;
+    if (alt_cutoff < 0) {
+        /* Fast path: no alternatives */
+        const char *tokens[64];
+        int n;
+        while ((n = vox_stream_get(s, tokens, 64)) > 0) {
+            for (int i = 0; i < n; i++) {
+                const char *t = tokens[i];
+                if (first_token) {
+                    while (*t == ' ') t++;
+                    first_token = 0;
+                }
+                fputs(t, stdout);
             }
-            fputs(t, stdout);
+            fflush(stdout);
         }
-        fflush(stdout);
+    } else {
+        /* Alternatives mode */
+        const int n_alt = 3;
+        const char *tokens[64 * 3];
+        int n;
+        while ((n = vox_stream_get_alt(s, tokens, 64, n_alt)) > 0) {
+            for (int i = 0; i < n; i++) {
+                const char *best = tokens[i * n_alt];
+                if (!best) continue;
+                /* Check for alternatives */
+                int has_alt = 0;
+                for (int a = 1; a < n_alt; a++) {
+                    if (tokens[i * n_alt + a]) { has_alt = 1; break; }
+                }
+                if (has_alt) {
+                    fputc('[', stdout);
+                    for (int a = 0; a < n_alt; a++) {
+                        const char *alt = tokens[i * n_alt + a];
+                        if (!alt) break;
+                        if (a > 0) fputc('|', stdout);
+                        const char *t = alt;
+                        if (a == 0 && first_token) {
+                            while (*t == ' ') t++;
+                            first_token = 0;
+                        }
+                        fputs(t, stdout);
+                    }
+                    fputc(']', stdout);
+                } else {
+                    const char *t = best;
+                    if (first_token) {
+                        while (*t == ' ') t++;
+                        first_token = 0;
+                    }
+                    fputs(t, stdout);
+                }
+            }
+            fflush(stdout);
+        }
     }
 }
 
@@ -78,6 +123,12 @@ int main(int argc, char **argv) {
             interval = (float)atof(argv[++i]);
             if (interval <= 0) {
                 fprintf(stderr, "Error: -I requires a positive number of seconds\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--alt") == 0 && i + 1 < argc) {
+            alt_cutoff = (float)atof(argv[++i]);
+            if (alt_cutoff < 0 || alt_cutoff > 1) {
+                fprintf(stderr, "Error: --alt requires a value between 0.0 and 1.0\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--stdin") == 0) {
@@ -125,6 +176,8 @@ int main(int argc, char **argv) {
         vox_free(ctx);
         return 1;
     }
+    if (alt_cutoff >= 0)
+        vox_stream_set_alt(s, 3, alt_cutoff);
     if (interval > 0) {
         vox_set_processing_interval(s, interval);
         feed_chunk = (int)(interval * VOX_SAMPLE_RATE);

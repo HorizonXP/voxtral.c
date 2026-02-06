@@ -377,11 +377,15 @@ struct vox_stream {
     int eos_seen;
     int finished;       /* vox_stream_finish() called */
 
-    /* Pending token queue (circular buffer of const char* into tokenizer) */
-    const char **token_queue;
-    int queue_head;     /* next to read */
-    int queue_tail;     /* next to write */
-    int queue_cap;
+    /* Pending token queue (circular buffer, VOX_MAX_ALT strings per position) */
+    const char **token_queue;   /* [queue_cap * VOX_MAX_ALT] */
+    int queue_head;     /* next position to read */
+    int queue_tail;     /* next position to write */
+    int queue_cap;      /* capacity in token positions */
+
+    /* Alternative token settings */
+    int n_alt;           /* max alternatives to track (default 1 = no alternatives) */
+    float alt_cutoff;    /* max distance from top token (0.0-1.0) */
 
     /* Decoder working buffers */
     float *logits;
@@ -398,18 +402,21 @@ struct vox_stream {
     int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
 
-static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
+/* Enqueue one token position. alts[0]=best, alts[1..VOX_MAX_ALT-1]=alternatives or NULL. */
+static void stream_enqueue_token(vox_stream_t *s, const char *alts[VOX_MAX_ALT]) {
     /* Grow queue if full */
     int next_tail = (s->queue_tail + 1) % s->queue_cap;
     if (next_tail == s->queue_head) {
         int old_cap = s->queue_cap;
         int new_cap = old_cap * 2;
-        const char **new_q = (const char **)malloc((size_t)new_cap * sizeof(const char *));
+        const char **new_q = (const char **)calloc((size_t)new_cap * VOX_MAX_ALT, sizeof(const char *));
         if (!new_q) return;
         /* Copy old entries in order */
         int n = 0;
         for (int i = s->queue_head; i != s->queue_tail; i = (i + 1) % old_cap) {
-            new_q[n++] = s->token_queue[i];
+            memcpy(&new_q[n * VOX_MAX_ALT], &s->token_queue[i * VOX_MAX_ALT],
+                   VOX_MAX_ALT * sizeof(const char *));
+            n++;
         }
         free(s->token_queue);
         s->token_queue = new_q;
@@ -418,7 +425,8 @@ static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
         s->queue_cap = new_cap;
         next_tail = (s->queue_tail + 1) % s->queue_cap;
     }
-    s->token_queue[s->queue_tail] = piece;
+    memcpy(&s->token_queue[s->queue_tail * VOX_MAX_ALT], alts,
+           VOX_MAX_ALT * sizeof(const char *));
     s->queue_tail = next_tail;
 }
 
@@ -723,6 +731,65 @@ static void stream_run_encoder(vox_stream_t *s) {
                 new_mel, conv_out_len, usable, s->total_adapter, leftover);
 }
 
+/* Build alternatives array from logits. alts[0]=best (already decoded as best_token).
+ * Fills alts[1..] with qualifying alternatives. */
+static void stream_fill_alts(vox_stream_t *s, int best_token,
+                              const char *alts[VOX_MAX_ALT]) {
+    memset(alts, 0, VOX_MAX_ALT * sizeof(const char *));
+    alts[0] = vox_tokenizer_decode(s->tokenizer, best_token);
+
+    if (s->n_alt <= 1) return;
+
+    /* Softmax over logits to get probabilities */
+    float *logits = s->logits;
+    float max_val = logits[0];
+    for (int i = 1; i < VOX_VOCAB_SIZE; i++)
+        if (logits[i] > max_val) max_val = logits[i];
+
+    float sum = 0;
+    for (int i = 0; i < VOX_VOCAB_SIZE; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < VOX_VOCAB_SIZE; i++)
+        logits[i] *= inv_sum;
+
+    float best_prob = logits[best_token];
+    if (best_prob <= 0) return;
+
+    /* Find top alternatives by repeated scan (n_alt is small, <=4) */
+    int found = 1; /* alts[0] already set */
+    int used[VOX_MAX_ALT];
+    used[0] = best_token;
+
+    while (found < s->n_alt) {
+        int best_idx = -1;
+        float best_p = -1;
+        for (int i = 1000; i < VOX_VOCAB_SIZE; i++) {
+            if (i == best_token) continue;
+            /* Skip already-picked */
+            int skip = 0;
+            for (int j = 1; j < found; j++)
+                if (used[j] == i) { skip = 1; break; }
+            if (skip) continue;
+
+            if (logits[i] > best_p) {
+                best_p = logits[i];
+                best_idx = i;
+            }
+        }
+        if (best_idx < 0) break;
+
+        float r = 1.0f - best_p / best_prob;
+        if (r > s->alt_cutoff) break;
+
+        used[found] = best_idx;
+        alts[found] = vox_tokenizer_decode(s->tokenizer, best_idx);
+        found++;
+    }
+}
+
 /* Run decoder: prefill if needed, then generate tokens while adapter available */
 static void stream_run_decoder(vox_stream_t *s) {
     struct timeval t0, t1;
@@ -762,8 +829,9 @@ static void stream_run_decoder(vox_stream_t *s) {
 
         /* Enqueue if it's a text token */
         if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
-            const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-            if (piece) { stream_enqueue_token(s, piece); s->n_text_tokens++; }
+            const char *alts[VOX_MAX_ALT];
+            stream_fill_alts(s, s->prev_token, alts);
+            if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
         }
         if (s->prev_token == TOKEN_EOS) s->eos_seen = 1;
 
@@ -793,8 +861,9 @@ static void stream_run_decoder(vox_stream_t *s) {
             s->n_generated++;
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
-                const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-                if (piece) { stream_enqueue_token(s, piece); s->n_text_tokens++; }
+                const char *alts[VOX_MAX_ALT];
+                stream_fill_alts(s, s->prev_token, alts);
+                if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
             }
 
             s->gen_pos++;
@@ -828,9 +897,10 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         return NULL;
     }
 
-    /* Token queue */
+    /* Token queue (VOX_MAX_ALT strings per position) */
     s->queue_cap = 256;
-    s->token_queue = (const char **)malloc((size_t)s->queue_cap * sizeof(const char *));
+    s->token_queue = (const char **)calloc((size_t)s->queue_cap * VOX_MAX_ALT, sizeof(const char *));
+    s->n_alt = 1;
 
     /* Decoder working buffers */
     int dim = VOX_DEC_DIM;
@@ -903,7 +973,33 @@ int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max) {
     if (!s || max <= 0) return 0;
     int count = 0;
     while (count < max && s->queue_head != s->queue_tail) {
-        out_tokens[count++] = s->token_queue[s->queue_head];
+        out_tokens[count++] = s->token_queue[s->queue_head * VOX_MAX_ALT];
+        s->queue_head = (s->queue_head + 1) % s->queue_cap;
+    }
+    return count;
+}
+
+void vox_stream_set_alt(vox_stream_t *s, int n_alt, float cutoff) {
+    if (!s) return;
+    if (n_alt < 1) n_alt = 1;
+    if (n_alt > VOX_MAX_ALT) n_alt = VOX_MAX_ALT;
+    if (cutoff < 0) cutoff = 0;
+    if (cutoff > 1) cutoff = 1;
+    s->n_alt = n_alt;
+    s->alt_cutoff = cutoff;
+}
+
+int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
+                       int max_tokens, int n_alt) {
+    if (!s || max_tokens <= 0 || n_alt <= 0) return 0;
+    if (n_alt > VOX_MAX_ALT) n_alt = VOX_MAX_ALT;
+    int count = 0;
+    while (count < max_tokens && s->queue_head != s->queue_tail) {
+        const char **src = &s->token_queue[s->queue_head * VOX_MAX_ALT];
+        const char **dst = &out_tokens[count * n_alt];
+        for (int a = 0; a < n_alt; a++)
+            dst[a] = src[a];
+        count++;
         s->queue_head = (s->queue_head + 1) % s->queue_cap;
     }
     return count;

@@ -67,7 +67,19 @@ Tokens stream to stdout as they are generated. By default, timing info is printe
 ```bash
 ./voxtral -d voxtral-model -i samples/test_speech.wav --silent    # no stderr output
 ./voxtral -d voxtral-model -i samples/test_speech.wav --debug     # per-layer/per-chunk details
+./voxtral -d voxtral-model -i samples/test_speech.wav --alt 0.5   # show alternative tokens
 ```
+
+### Alternative Tokens
+
+When the model is uncertain between similar-sounding words, `--alt <cutoff>` shows the competing candidates inline:
+
+```
+./voxtral -d voxtral-model -i audio.wav --alt 0.95
+Hello, this is a test of the[ V| Vo]ox[T|tral]roll speech-to-text system.
+```
+
+The cutoff (0.0–1.0) controls how close an alternative must be to the best token. A token qualifies if `1 - prob[i]/prob[0] <= cutoff`. Lower values show only very close alternatives, higher values are more permissive.
 
 ### Reading Audio from Stdin
 
@@ -161,6 +173,25 @@ vox_stream_free(s);
 `feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
 
 Use `vox_set_processing_interval(s, seconds)` to batch encoder/decoder work. When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed (0 = process on every `feed()`, the default). This can improve efficiency when feeding audio in many small chunks.
+
+**Alternative tokens** — when the model is uncertain, retrieve competing candidates:
+
+```c
+vox_stream_set_alt(s, 3, 0.5);  /* up to 3 alternatives, cutoff 0.5 */
+
+const int n_alt = 3;
+const char *tokens[16 * 3];
+int n;
+while ((n = vox_stream_get_alt(s, tokens, 16, n_alt)) > 0) {
+    for (int i = 0; i < n; i++) {
+        printf("%s", tokens[i * n_alt]);  /* best token */
+        for (int a = 1; a < n_alt && tokens[i * n_alt + a]; a++)
+            printf(" [alt: %s]", tokens[i * n_alt + a]);
+    }
+}
+```
+
+`vox_stream_get()` is unaffected — it always returns just the best token.
 
 There is also a one-shot convenience function if you don't need streaming:
 
