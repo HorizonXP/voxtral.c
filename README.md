@@ -399,3 +399,7 @@ If `pulse` is unavailable in your WSL distribution, use a host-side capture path
 # Compares BLAS vs CUDA transcripts with token mismatch tolerance (default: 0.5%)
 ./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
 ```
+
+### Full migration handoff notes
+
+For end-to-end continuation guidance (status, remaining work, and step-by-step next actions on your WSL2 machine), see `HANDOFF_CUDA_WSL2.md`.
