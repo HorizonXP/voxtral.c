@@ -5,6 +5,9 @@ CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDFLAGS = -lm
 
+# CUDA toolkit location (override with: make cuda CUDA_HOME=/path/to/cuda)
+CUDA_HOME ?= /usr/local/cuda
+
 # Platform detection
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -18,7 +21,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas cuda mps inspect test
+.PHONY: all clean debug info help blas cuda cuda-check mps inspect test
 
 # Default: show available targets
 all: help
@@ -60,11 +63,14 @@ blas: clean $(TARGET)
 # =============================================================================
 # Backend: cuda (NVIDIA CUDA + cuBLAS)
 # =============================================================================
-cuda: CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I/usr/local/cuda/include
-cuda: LDFLAGS += -L/usr/local/cuda/lib64 -lcublas -lcudart
-cuda: clean $(TARGET)
+cuda: CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I$(CUDA_HOME)/include
+cuda: LDFLAGS += -L$(CUDA_HOME)/lib64 -lcublas -lcudart
+cuda: cuda-check clean $(TARGET)
 	@echo ""
 	@echo "Built with CUDA backend (cuBLAS)"
+
+cuda-check:
+	@test -f "$(CUDA_HOME)/include/cuda_runtime.h" || (echo "Error: cuda_runtime.h not found under $(CUDA_HOME)/include" && echo "Tip: install CUDA toolkit in WSL2 and/or set CUDA_HOME" && exit 1)
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
