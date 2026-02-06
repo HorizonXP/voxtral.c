@@ -310,5 +310,6 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
 /* Decoder forward pass for prefill (multiple tokens) */
 void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len);
+int vox_decoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_seq);
 
 #endif /* VOXTRAL_H */

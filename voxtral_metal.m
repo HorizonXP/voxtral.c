@@ -2572,6 +2572,47 @@ void vox_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
     (void)get_cached_bf16_as_f16_buffer(bf16_weights, num_elements);
 }
 
+void vox_metal_warmup_merged_2(const uint16_t *a, size_t a_n,
+                                const uint16_t *b, size_t b_n) {
+    if (!g_initialized) return;
+    (void)get_merged_f16_2(a, a_n, b, b_n);
+}
+
+void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
+                                const uint16_t *b, size_t b_n,
+                                const uint16_t *c, size_t c_n) {
+    if (!g_initialized) return;
+    (void)get_merged_f16_3(a, a_n, b, b_n, c, c_n);
+}
+
+void vox_metal_warmup_decoder_ops(void *ctx_ptr) {
+    if (!g_initialized || !g_shaders_initialized) return;
+    vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
+    vox_decoder_t *dec = &ctx->decoder;
+    int dim = VOX_DEC_DIM;
+    int q_dim = VOX_DEC_HEADS * VOX_DEC_HEAD_DIM;
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    int hidden = VOX_DEC_HIDDEN;
+
+    /* Pre-warm MPS matmul ops (compiled on first creation) */
+    (void)get_cached_matmul_op(NO, YES, 1, q_dim + kv_dim + kv_dim, dim, 1.0, 0.0);
+    (void)get_cached_matmul_op(NO, YES, 1, dim, q_dim, 1.0, 0.0);
+    (void)get_cached_matmul_op(NO, YES, 1, hidden * 2, dim, 1.0, 0.0);
+    (void)get_cached_matmul_op(NO, YES, 1, dim, hidden, 1.0, 0.0);
+    (void)get_cached_matmul_op(NO, YES, 1, VOX_VOCAB_SIZE, dim, 1.0, 0.0);
+
+    /* Pre-warm f32 weight buffers (norms, ada_scale) */
+    for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+        vox_dec_layer_t *l = &dec->layers[i];
+        (void)get_cached_weight_buffer(l->attention_norm, dim * sizeof(float));
+        (void)get_cached_weight_buffer(l->ffn_norm, dim * sizeof(float));
+        if (ctx->ada_scale)
+            (void)get_cached_weight_buffer(
+                ctx->ada_scale + (size_t)i * dim, dim * sizeof(float));
+    }
+    (void)get_cached_weight_buffer(dec->norm, dim * sizeof(float));
+}
+
 size_t vox_metal_memory_used(void) {
     if (!g_initialized) return 0;
     size_t total = 0;

@@ -9,6 +9,7 @@
 
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
+- Prefill: ~500ms (was ~1200ms)
 - Encoder: ~456ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
@@ -97,11 +98,27 @@
 - **Result: encoder 605 → 456 ms (test_speech), 1242 → 1082 ms (jfk)**
 - **Cumulative encoder: 2.7s → 456 ms (83% faster)**
 
+### Attempt 9: Pre-warm merged weights + KV cache + decoder ops (SUCCESS)
+- Pre-warm merged weight buffers (QKV, w1+w3) during model loading instead of first decoder step
+  - 26 layers × merged QKV (~38MB) + merged w1+w3 (~113MB) = ~3.9 GB created at load time
+- Pre-allocate KV cache as shared GPU memory during model loading (saves ~130ms per run)
+- Pre-warm MPS matmul ops and f32 weight caches (norms, ada_scale) during loading
+- Reuse KV cache across decoder restarts (don't free+realloc on each audio file)
+- Fused QKV and FFN for decoder prefill (3 cmd bufs/layer instead of 7)
+- **Result: prefill 1212 → 500 ms (test_speech), 1166 → 499 ms (jfk) — 57% faster**
+
+### Failed: GPU decoder prefill
+- Moved prefill matmuls from individual sgemm to fused_qkv + batched_attention + fused_ffn
+- No improvement over individual sgemm path — GPU compute dominates for M=97, cmd buf overhead minimal
+- The big win was pre-warming (moved 700ms of lazy init to model loading), not fusion
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
 - Encoder: ~456ms for test_speech
   - Still 32 command buffer round-trips (1 per layer for attention)
-  - Ideas: merged encoder QKV weights, fused encoder layers
+  - Ideas: merged encoder QKV weights
+- Prefill: ~500ms, dominated by GPU compute (M=97 matmuls through 26 layers)
+  - ~200ms of first-token overhead remains (MPS pipeline warmup on first cmd buffer)
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX

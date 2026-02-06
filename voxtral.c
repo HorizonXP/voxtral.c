@@ -207,6 +207,26 @@ vox_ctx_t *vox_load(const char *model_dir) {
         vox_metal_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
                               (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
 
+        /* Pre-warm merged weight buffers for monolithic decoder step */
+        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+            vox_dec_layer_t *l = &ctx->decoder.layers[i];
+            /* Merged QKV = wq + wk + wv */
+            vox_metal_warmup_merged_3(
+                l->wq_weight_bf16, (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
+                l->wk_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
+                l->wv_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM);
+            /* Merged w1+w3 */
+            vox_metal_warmup_merged_2(
+                l->w1_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM,
+                l->w3_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM);
+        }
+
+        /* Pre-warm decoder MPS ops and f32 weight caches */
+        vox_metal_warmup_decoder_ops(ctx);
+
+        /* Pre-allocate KV cache (shared GPU memory) */
+        vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
+
         if (vox_verbose >= 1)
             fprintf(stderr, "Metal GPU: %.1f MB\n",
                     vox_metal_memory_used() / (1024.0 * 1024.0));
@@ -820,18 +840,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 
         s->ctx->kv_cache_len = 0;
         s->ctx->kv_pos_offset = 0;
-#ifdef USE_METAL
-        vox_metal_shared_free(s->ctx->kv_cache_k);
-#else
-        free(s->ctx->kv_cache_k);
-#endif
-        s->ctx->kv_cache_k = NULL;
-#ifdef USE_METAL
-        vox_metal_shared_free(s->ctx->kv_cache_v);
-#else
-        free(s->ctx->kv_cache_v);
-#endif
-        s->ctx->kv_cache_v = NULL;
+        /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it */
 
         int prefill_count = prompt_len - 1;
         vox_decoder_prefill(s->ctx, prompt_embeds, prefill_count);

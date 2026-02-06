@@ -224,6 +224,16 @@ int vox_metal_decoder_full_step(void *ctx, const float *rope_freqs, float *logit
  */
 void vox_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 
+/* Pre-warm MPS matmul ops and f32 weight caches for decoder. */
+void vox_metal_warmup_decoder_ops(void *ctx);
+
+/* Pre-warm merged weight buffers (used by monolithic decoder step). */
+void vox_metal_warmup_merged_2(const uint16_t *a, size_t a_n,
+                                const uint16_t *b, size_t b_n);
+void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
+                                const uint16_t *b, size_t b_n,
+                                const uint16_t *c, size_t c_n);
+
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);
 
