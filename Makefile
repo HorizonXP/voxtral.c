@@ -10,7 +10,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c voxtral_tokenizer.c voxtral_safetensors.c
+SRCS = voxtral.c voxtral_kernels.c voxtral_cuda.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c voxtral_tokenizer.c voxtral_safetensors.c
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
 TARGET = voxtral
@@ -18,7 +18,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas mps inspect test
+.PHONY: all clean debug info help blas cuda mps inspect test
 
 # Default: show available targets
 all: help
@@ -28,6 +28,7 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make cuda     - NVIDIA CUDA + cuBLAS (Linux/WSL2)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -55,6 +56,15 @@ endif
 blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend"
+
+# =============================================================================
+# Backend: cuda (NVIDIA CUDA + cuBLAS)
+# =============================================================================
+cuda: CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I/usr/local/cuda/include
+cuda: LDFLAGS += -L/usr/local/cuda/lib64 -lcublas -lcudart
+cuda: clean $(TARGET)
+	@echo ""
+	@echo "Built with CUDA backend (cuBLAS)"
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
@@ -139,13 +149,15 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  cuda    - NVIDIA CUDA + cuBLAS"
 endif
 
 # =============================================================================
 # Dependencies
 # =============================================================================
 voxtral.o: voxtral.c voxtral.h voxtral_kernels.h voxtral_safetensors.h voxtral_audio.h voxtral_tokenizer.h
-voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h
+voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h voxtral_cuda.h
+voxtral_cuda.o: voxtral_cuda.c voxtral_cuda.h
 voxtral_audio.o: voxtral_audio.c voxtral_audio.h
 voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
 voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h

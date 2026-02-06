@@ -18,6 +18,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make cuda    # NVIDIA CUDA/cuBLAS (Linux/WSL2)
 
 # Download the model (~8.9GB)
 ./download_model.sh
@@ -225,13 +226,15 @@ Choose a backend when building:
 ```bash
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make cuda       # NVIDIA CUDA/cuBLAS acceleration (Linux/WSL2)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with OpenBLAS: `make blas`
+- Linux with NVIDIA GPU (including WSL2): `make cuda`
+- Linux CPU-only / OpenBLAS: `make blas`
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -315,3 +318,27 @@ WAV → 16kHz → Mel Spectrogram → Conv Stem → Encoder → Downsample 4x �
 ## License
 
 MIT
+
+## CUDA on Windows 11 + WSL2 (Ubuntu)
+
+This repository now includes a CUDA backend that uses **cuBLAS** for large matrix multiplies (`make cuda`).
+
+### Prerequisites
+
+1. Install the latest NVIDIA Windows driver with WSL CUDA support.
+2. Install WSL2 + Ubuntu 22.04+.
+3. Inside Ubuntu, install the CUDA toolkit (includes `nvcc`, `cublas`, and runtime libraries).
+
+### Build
+
+```bash
+make cuda
+```
+
+### Verify CUDA visibility in WSL2
+
+```bash
+nvidia-smi
+```
+
+If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will offload large GEMMs to the GPU.
