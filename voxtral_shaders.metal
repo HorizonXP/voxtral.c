@@ -356,12 +356,18 @@ kernel void decoder_attention(
 }
 
 /* ========================================================================
- * Batched attention: one threadgroup per (head, query_position).
+ * Q-tiled batched attention: one threadgroup per (head, query_block).
+ * Processes ATTN_BQ queries per threadgroup, amortizing K/V memory reads.
  * Supports head_dim=64 (64 threads, 2 SIMD groups) and head_dim=128
  * (128 threads, 4 SIMD groups). Used for both encoder and decoder prefill.
  * Q/K/V layout: [seq, n_heads * head_dim] packed (head-interleaved).
  * Uses online softmax, cooperative SIMD dot products.
+ *
+ * Grid: n_heads * ceil(seq_q / ATTN_BQ) threadgroups.
+ * group_idx = h * n_q_blocks + qb.
  * ======================================================================== */
+
+#define ATTN_BQ 8
 
 kernel void encoder_attention(
     device const float *Q [[buffer(0)]],
@@ -382,69 +388,95 @@ kernel void encoder_attention(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint tg_size [[threads_per_threadgroup]]
 ) {
-    /* 1D grid: group_idx = h * seq_q + qi */
-    int h = (int)group_idx / seq_q;
-    int qi = (int)group_idx % seq_q;
-    if (h >= n_heads || qi >= seq_q) return;
+    int n_q_blocks = (seq_q + ATTN_BQ - 1) / ATTN_BQ;
+    int h = (int)group_idx / n_q_blocks;
+    int qb = (int)group_idx % n_q_blocks;
+    int qi_start = qb * ATTN_BQ;
+    if (h >= n_heads) return;
 
     int gqa_ratio = n_heads / n_kv_heads;
     int kv_h = h / gqa_ratio;
     int stride_q = n_heads * head_dim;
     int stride_kv = n_kv_heads * head_dim;
-
-    device const float *q_row = Q + (long)qi * stride_q + h * head_dim;
-    device float *out_row = out + (long)qi * stride_q + h * head_dim;
-
-    int q_pos = q_offset + qi;
-    int valid_end = min(q_pos, seq_k - 1);
-    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
-
-    /* Up to 4 SIMD groups (supports head_dim 64 and 128) */
-    threadgroup float shared_simd[4];
     int n_simd_groups = (int)tg_size / 32;
 
-    float q_val = (int)tid < head_dim ? q_row[tid] : 0.0f;
+    /* Load BQ query values (one head_dim element per thread, BQ queries) */
+    float q_vals[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        int qi = qi_start + b;
+        q_vals[b] = (qi < seq_q && (int)tid < head_dim)
+            ? Q[(long)qi * stride_q + h * head_dim + tid] : 0.0f;
+    }
 
-    /* Online softmax: single pass over keys */
-    float running_max = -INFINITY;
-    float running_sum = 0.0f;
-    float acc = 0.0f;
+    /* Per-query online softmax state */
+    float rmax[ATTN_BQ], rsum[ATTN_BQ], acc[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        rmax[b] = -INFINITY;
+        rsum[b] = 0.0f;
+        acc[b] = 0.0f;
+    }
 
-    for (int j = valid_start; j <= valid_end; j++) {
+    /* Shared memory for cross-SIMD dot product reduction */
+    threadgroup float tg_simd[4 * ATTN_BQ];
+    threadgroup float tg_scores[ATTN_BQ];
+
+    /* Compute loop range: union of all BQ queries' valid key ranges */
+    int last_qi = min(qi_start + ATTN_BQ - 1, seq_q - 1);
+    int first_pos = q_offset + qi_start;
+    int last_pos = q_offset + last_qi;
+    int loop_start = (window_size > 0) ? max(0, first_pos - window_size + 1) : 0;
+    int loop_end = min(last_pos, seq_k - 1);
+
+    for (int j = loop_start; j <= loop_end; j++) {
         device const float *k_j = K + (long)j * stride_kv + kv_h * head_dim;
+        float k_val = (int)tid < head_dim ? k_j[tid] : 0.0f;
 
-        /* Cooperative dot product using SIMD reductions */
-        float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
-        float simd_partial = simd_sum(partial);
-
-        /* Cross-SIMD reduction */
-        if (simd_lid == 0) shared_simd[simd_gid] = simd_partial;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            float sum = shared_simd[0];
-            for (int g = 1; g < n_simd_groups; g++) sum += shared_simd[g];
-            shared_simd[0] = sum * scale;
+        /* BQ dot products via simd_sum + cross-SIMD store */
+        for (int b = 0; b < ATTN_BQ; b++) {
+            float simd_dot = simd_sum(q_vals[b] * k_val);
+            if (simd_lid == 0) tg_simd[simd_gid * ATTN_BQ + b] = simd_dot;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float score = shared_simd[0];
 
-        /* Online softmax update */
-        float old_max = running_max;
-        running_max = fmax(running_max, score);
-        float correction = exp(old_max - running_max);
-        running_sum = running_sum * correction + exp(score - running_max);
-        acc = acc * correction;
+        /* Cross-SIMD reduction: first BQ threads each reduce one score */
+        if ((int)tid < ATTN_BQ) {
+            float sum = 0;
+            for (int g = 0; g < n_simd_groups; g++)
+                sum += tg_simd[g * ATTN_BQ + (int)tid];
+            tg_scores[(int)tid] = sum * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* Accumulate weighted V */
-        if ((int)tid < head_dim) {
-            device const float *v_j = V + (long)j * stride_kv + kv_h * head_dim;
-            acc += exp(score - running_max) * v_j[tid];
+        /* Load V once for this key position */
+        device const float *v_j = V + (long)j * stride_kv + kv_h * head_dim;
+        float v_val = (int)tid < head_dim ? v_j[tid] : 0.0f;
+
+        /* Update BQ online softmax + accumulate weighted V */
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi >= seq_q) continue;
+            int q_pos = q_offset + qi;
+            int vs = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+            if (j < vs || j > q_pos) continue;
+
+            float score = tg_scores[b];
+            float old_max = rmax[b];
+            rmax[b] = fmax(rmax[b], score);
+            float corr = exp(old_max - rmax[b]);
+            rsum[b] = rsum[b] * corr + exp(score - rmax[b]);
+            acc[b] = acc[b] * corr + exp(score - rmax[b]) * v_val;
         }
     }
 
-    /* Normalize and write output */
+    /* Write BQ outputs */
     if ((int)tid < head_dim) {
-        out_row[tid] = acc / (running_sum + 1e-10f);
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi < seq_q) {
+                device float *out_row = out + (long)qi * stride_q + h * head_dim;
+                out_row[tid] = acc[b] / (rsum[b] + 1e-10f);
+            }
+        }
     }
 }
 

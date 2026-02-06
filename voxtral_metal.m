@@ -2265,8 +2265,10 @@ void vox_metal_encoder_attention(float *out,
         [enc setBytes:&window_size length:sizeof(int) atIndex:10];
         [enc setBytes:&q_offset length:sizeof(int) atIndex:11];
 
-        /* 1D grid: n_heads * seq_q threadgroups, 64 threads each (head_dim=64) */
-        NSUInteger total_groups = (NSUInteger)n_heads * (NSUInteger)seq_q;
+        /* 1D grid: n_heads * ceil(seq_q/BQ) threadgroups, Q-tiled attention */
+        int bq = 8; /* must match ATTN_BQ in shader */
+        int n_q_blocks = (seq_q + bq - 1) / bq;
+        NSUInteger total_groups = (NSUInteger)n_heads * (NSUInteger)n_q_blocks;
         [enc dispatchThreadgroups:MTLSizeMake(total_groups, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [enc endEncoding];
@@ -2852,7 +2854,9 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
                 [enc_cmd setBytes:&window length:sizeof(int) atIndex:10];
                 [enc_cmd setBytes:&q_offset_val length:sizeof(int) atIndex:11];
                 {
-                    int n_groups = n_heads * M;
+                    int bq = 8; /* must match ATTN_BQ in shader */
+                    int n_q_blocks = (M + bq - 1) / bq;
+                    int n_groups = n_heads * n_q_blocks;
                     [enc_cmd dispatchThreadgroups:MTLSizeMake((NSUInteger)n_groups, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                 }
@@ -3329,8 +3333,9 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
                 [enc_cmd setBytes:&window length:sizeof(int) atIndex:10];
                 [enc_cmd setBytes:&q_offset_val length:sizeof(int) atIndex:11];
                 {
-                    /* head_dim threads per group, 1 group per (head, query_pos) */
-                    int n_groups = n_heads * M;
+                    int bq = 8; /* must match ATTN_BQ in shader */
+                    int n_q_blocks = (M + bq - 1) / bq;
+                    int n_groups = n_heads * n_q_blocks;
                     [enc_cmd dispatchThreadgroups:MTLSizeMake((NSUInteger)n_groups, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
                 }
