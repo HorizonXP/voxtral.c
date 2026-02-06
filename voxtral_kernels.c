@@ -12,6 +12,10 @@
 #include "voxtral_metal.h"
 #endif
 
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -52,6 +56,11 @@ void vox_copy(float *dst, const float *src, int n) {
  * ======================================================================== */
 
 void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS && vox_cuda_matmul(C, A, B, M, K, N)) {
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
@@ -69,6 +78,11 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 }
 
 void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS && vox_cuda_matmul_t(C, A, B, M, K, N)) {
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
