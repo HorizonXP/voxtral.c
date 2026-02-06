@@ -28,6 +28,10 @@ make mps       # Apple Silicon (fastest)
 # Pipe any format via ffmpeg
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
     ./voxtral -d voxtral-model --stdin
+
+# Real-time streaming with low latency
+ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
+    ./voxtral -d voxtral-model --stdin -I 0.5
 ```
 
 That's it. No Python runtime, no CUDA toolkit, no `mistral_common` or vLLM required at inference time.
@@ -80,6 +84,19 @@ Hello, this is a test of the[ V| Vo]ox[T|tral]roll speech-to-text system.
 ```
 
 The cutoff (0.0–1.0) controls how close an alternative must be to the best token. A token qualifies if `1 - prob[i]/prob[0] <= cutoff`. Lower values show only very close alternatives, higher values are more permissive.
+
+### Processing Interval (`-I`)
+
+The `-I <seconds>` flag controls how often the encoder processes accumulated audio. This is the key latency/efficiency tradeoff:
+
+```bash
+./voxtral -d voxtral-model --stdin -I 0.5    # low latency (responsive, more GPU overhead)
+./voxtral -d voxtral-model --stdin -I 5.0    # high efficiency (batches more audio per encoder call)
+```
+
+The default is 2.0 seconds. Lower values make streaming more responsive (text appears sooner after speech) but increase GPU overhead because each encoder call has a fixed startup cost (~50ms). Higher values batch more audio into fewer, larger encoder calls, improving GPU utilization.
+
+The overhead is significant: on a 60-second clip, batch mode takes ~2.9s for the encoder, while `-I 0.1` takes ~15.8s (5.4x slower) because of hundreds of small encoder calls each paying the fixed cost. For **real-time streaming**, values between 1.0 and 2.0 work well. Going below 0.5 wastes most of the GPU time on per-call overhead. For **offline file transcription** the interval is irrelevant since all audio is available at once.
 
 ### Reading Audio from Stdin
 
@@ -172,7 +189,7 @@ vox_stream_free(s);
 
 `feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
 
-Use `vox_set_processing_interval(s, seconds)` to batch encoder/decoder work. When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed (0 = process on every `feed()`, the default). This can improve efficiency when feeding audio in many small chunks.
+Use `vox_set_processing_interval(s, seconds)` to control the latency/efficiency tradeoff (equivalent to `-I` on the CLI). When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed. Lower values give more responsive streaming (text appears sooner), higher values batch more audio per encoder call for better GPU utilization. Default is 2.0 seconds. See the `-I` flag documentation above for guidance on choosing values.
 
 **Alternative tokens** — when the model is uncertain, retrieve competing candidates:
 
@@ -249,14 +266,16 @@ The model is [Apache-2.0 licensed](https://huggingface.co/mistralai/Voxtral-Mini
 
 ## How Fast Is It?
 
-Benchmarks on **Apple M3 Max** (128GB RAM):
+Benchmarks on **Apple M3 Max** (40-core GPU, 128GB RAM, 400 GB/s bandwidth):
 
-| Backend | Encoder (3.6s audio) | Decoder (ms/token) | Total |
-|---------|---------------------|--------------------|-------|
-| MPS | 2.4s | 43 ms | ~5s |
-| BLAS | ~8s | 335 ms | ~28s |
+| Backend | Encoder (3.6s audio) | Prefill | Decoder |
+|---------|---------------------|---------|---------|
+| MPS | 284 ms | 252 ms | 23.5 ms/step (short) |
+| BLAS | ~8s | ~1.2s | 335 ms/step |
 
-The MPS backend uses fused GPU operations (QKV, FFN, batched attention) to minimize command buffer overhead. The BLAS backend uses Accelerate's multi-threaded sgemm with on-the-fly BF16→F32 conversion.
+The MPS backend runs the entire decoder in a single Metal command buffer per token, with custom GPU kernels for attention, RoPE, and KV cache management. All weights are pre-converted to f16 on GPU at load time. The BLAS backend uses Accelerate's multi-threaded sgemm with on-the-fly BF16→F32 conversion.
+
+Decoder speed depends on sequence length: attention scans the full KV cache each step, so longer transcriptions are slower per token. For a 60-second clip (~760 steps), the average is ~31.6 ms/step. For short clips (~15 steps) it's ~23.5 ms/step. Either way, the decoder generates one token per ~80ms of audio, so even at 31.6 ms/step transcription runs ~2.5x faster than real-time.
 
 Longer audio scales linearly with the encoder (O(n) with sliding window attention) and the decoder (one token per 80ms of audio).
 
