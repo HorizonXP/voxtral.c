@@ -320,3 +320,32 @@ If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will o
 # Compare BLAS vs CUDA timing + output files
 ./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
 ```
+
+
+### Driver / Toolkit matrix (known-good starting point)
+
+| Layer | Recommended |
+|---|---|
+| Windows host | Windows 11 23H2+ |
+| NVIDIA driver | R550+ with WSL CUDA support |
+| WSL | WSL2 (`wsl --update`) |
+| Ubuntu guest | 22.04 LTS or 24.04 LTS |
+| CUDA toolkit in Ubuntu | 12.4+ |
+| GPU class tested target | RTX 3080 Ti |
+
+### Real-time microphone pipeline recipe (WSL2)
+
+```bash
+# Windows host: capture mic with ffmpeg (or equivalent) and pipe raw PCM into WSL voxtral
+# Example run *inside* WSL when mic source is exposed by ffmpeg:
+ffmpeg -f pulse -i default -f s16le -ar 16000 -ac 1 - 2>/dev/null |   ./voxtral -d voxtral-model --stdin
+```
+
+If `pulse` is unavailable in your WSL distribution, use a host-side capture path and stream PCM into WSL over stdin or TCP.
+
+### Accuracy regression helper
+
+```bash
+# Compares BLAS vs CUDA transcripts with token mismatch tolerance (default: 0.5%)
+./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
+```
