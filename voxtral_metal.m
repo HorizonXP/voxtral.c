@@ -2307,77 +2307,68 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                                   l->wk_weight_bf16, kv_dim,
                                   l->wv_weight_bf16, kv_dim);
 
-            /* RoPE on Q */
+            /* RoPE + KV cache write + attention in single compute encoder */
             {
-                int n_threads = n_heads * (head_dim / 2);
+                int kv_offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+                size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
+                int window = VOX_DEC_WINDOW;
+                int q_pos_val = ctx->kv_pos_offset + pos;
+
                 id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+
+                /* RoPE on Q */
+                int n_threads_q = n_heads * (head_dim / 2);
                 [enc setComputePipelineState:g_rope_apply_pipeline];
                 [enc setBuffer:bufQ offset:0 atIndex:0];
                 [enc setBuffer:bufRope offset:0 atIndex:1];
                 [enc setBytes:&n_heads length:sizeof(int) atIndex:2];
                 [enc setBytes:&head_dim length:sizeof(int) atIndex:3];
-                NSUInteger tg = MIN((NSUInteger)n_threads,
-                                    g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
-                [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-            }
+                {
+                    NSUInteger tg = MIN((NSUInteger)n_threads_q,
+                                        g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads_q, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
 
-            /* RoPE on K */
-            {
-                int n_threads = n_kv_heads * (head_dim / 2);
-                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
-                [enc setComputePipelineState:g_rope_apply_pipeline];
+                /* RoPE on K (independent, can overlap with Q) */
+                int n_threads_k = n_kv_heads * (head_dim / 2);
                 [enc setBuffer:bufK offset:0 atIndex:0];
-                [enc setBuffer:bufRope offset:0 atIndex:1];
                 [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:2];
-                [enc setBytes:&head_dim length:sizeof(int) atIndex:3];
-                NSUInteger tg = MIN((NSUInteger)n_threads,
-                                    g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
-                [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-            }
+                {
+                    NSUInteger tg = MIN((NSUInteger)n_threads_k,
+                                        g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads_k, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
 
-            /* Write K to GPU KV cache */
-            {
-                int offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
-                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                /* Barrier: RoPE must finish before KV cache write reads K */
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                /* Write K to KV cache */
                 [enc setComputePipelineState:g_kv_cache_copy_pipeline];
                 [enc setBuffer:gpu_kv_k offset:0 atIndex:0];
                 [enc setBuffer:bufK offset:0 atIndex:1];
-                [enc setBytes:&offset length:sizeof(int) atIndex:2];
+                [enc setBytes:&kv_offset length:sizeof(int) atIndex:2];
                 [enc setBytes:&kv_dim length:sizeof(int) atIndex:3];
-                NSUInteger tg = MIN((NSUInteger)kv_dim,
-                                    g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
-                [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-            }
+                {
+                    NSUInteger tg = MIN((NSUInteger)kv_dim,
+                                        g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
 
-            /* Write V to GPU KV cache */
-            {
-                int offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
-                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
-                [enc setComputePipelineState:g_kv_cache_copy_pipeline];
+                /* Write V to KV cache (independent) */
                 [enc setBuffer:gpu_kv_v offset:0 atIndex:0];
                 [enc setBuffer:bufV offset:0 atIndex:1];
-                [enc setBytes:&offset length:sizeof(int) atIndex:2];
-                [enc setBytes:&kv_dim length:sizeof(int) atIndex:3];
-                NSUInteger tg = MIN((NSUInteger)kv_dim,
-                                    g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
                 [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-            }
+               threadsPerThreadgroup:MTLSizeMake(
+                    MIN((NSUInteger)kv_dim,
+                        g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
 
-            /* Single-token attention (all heads in parallel) */
-            {
-                size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
-                int window = VOX_DEC_WINDOW;
-                int q_pos = ctx->kv_pos_offset + pos;
+                /* Barrier: KV cache must be written before attention reads it */
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                /* Single-token attention */
                 [enc setComputePipelineState:g_decoder_attention_pipeline];
                 [enc setBuffer:bufQ offset:0 atIndex:0];
                 [enc setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
@@ -2390,9 +2381,10 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                 [enc setBytes:&total_seq length:sizeof(int) atIndex:8];
                 [enc setBytes:&scale length:sizeof(float) atIndex:9];
                 [enc setBytes:&window length:sizeof(int) atIndex:10];
-                [enc setBytes:&q_pos length:sizeof(int) atIndex:11];
+                [enc setBytes:&q_pos_val length:sizeof(int) atIndex:11];
                 [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
                 [enc endEncoding];
             }
         }

@@ -272,7 +272,8 @@ kernel void kv_cache_copy(
  * Single-token decoder attention (seq_q=1).
  * One threadgroup per query head, 128 threads cooperate on dot products.
  * K/V read from the KV cache buffer at a per-layer offset.
- * Uses online softmax (single pass) with cooperative reductions.
+ * Uses online softmax (single pass) with SIMD group reductions.
+ * 128 threads = 4 SIMD groups of 32. simd_sum for fast dot product.
  * ======================================================================== */
 
 kernel void decoder_attention(
@@ -290,7 +291,8 @@ kernel void decoder_attention(
     constant int &q_pos [[buffer(11)]],
     uint head_idx [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
 ) {
     if ((int)head_idx >= n_heads) return;
 
@@ -303,30 +305,34 @@ kernel void decoder_attention(
     int valid_end = min(q_pos, seq_k - 1);
     int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
 
-    threadgroup float shared_reduce[128];
+    /* 128 threads = 4 SIMD groups of 32 */
+    threadgroup float shared_simd[4];
 
-    /* Each thread loads one Q element (head_dim=128, tg_size=128) */
+    /* Each thread loads one Q element (head_dim=128) */
     float q_val = (int)tid < head_dim ? q_h[tid] : 0.0f;
 
     /* Online softmax: single pass over keys */
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float acc = 0.0f; /* V accumulator for this thread's dimension */
+    float acc = 0.0f;
 
     for (int j = valid_start; j <= valid_end; j++) {
         device const float *k_j = K_cache + j * kv_dim + kv_head * head_dim;
 
-        /* Cooperative dot product: each thread multiplies one element */
+        /* Cooperative dot product using SIMD reductions */
         float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
+        float simd_partial = simd_sum(partial);
 
-        /* Parallel reduction to compute full dot product */
-        shared_reduce[tid] = partial;
+        /* Cross-SIMD reduction: 4 groups → 1 value */
+        if (simd_lid == 0) shared_simd[simd_gid] = simd_partial;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        float score;
+        if (tid == 0) {
+            shared_simd[0] = (shared_simd[0] + shared_simd[1] +
+                              shared_simd[2] + shared_simd[3]) * scale;
         }
-        float score = shared_reduce[0] * scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        score = shared_simd[0];
 
         /* Online softmax update */
         float old_max = running_max;
