@@ -10,6 +10,9 @@
 #include "voxtral_safetensors.h"
 #include "voxtral_audio.h"
 #include "voxtral_tokenizer.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
@@ -276,6 +279,7 @@ void vox_free(vox_ctx_t *ctx) {
     free(ctx->dec_up);
     free(ctx->dec_ffn_out);
     free(ctx->dec_rope_freqs);
+    free(ctx->dec_logits);
 
     if (ctx->safetensors) {
         safetensors_close((safetensors_file_t *)ctx->safetensors);
@@ -345,6 +349,10 @@ struct vox_stream {
     /* Encoder chunk tracking */
     int mel_cursor;
     int chunk_num;
+    int overlap_mel;
+    int chunk_new_mel;
+    int first_chunk_min_mel;
+    int chunk_user_override;
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
@@ -414,10 +422,10 @@ static void stream_run_encoder(vox_stream_t *s) {
     int dim = VOX_DEC_DIM;
 
     int new_mel = total_mel - s->mel_cursor;
-    int need_mel = (s->chunk_num == 0) ? STREAM_FIRST_CHUNK_MIN_MEL : STREAM_CHUNK_NEW_MEL;
+    int need_mel = (s->chunk_num == 0) ? s->first_chunk_min_mel : s->chunk_new_mel;
 
     while (new_mel >= need_mel || (s->finished && new_mel > 0)) {
-        int overlap = (s->chunk_num == 0) ? 0 : OVERLAP_MEL;
+        int overlap = (s->chunk_num == 0) ? 0 : s->overlap_mel;
         int slice_start = s->mel_cursor - overlap;
         int actual_overlap_mel;
         if (slice_start < 0) {
@@ -430,36 +438,58 @@ static void stream_run_encoder(vox_stream_t *s) {
             actual_overlap_mel = s->mel_cursor - slice_start;
         }
         int slice_end = s->mel_cursor + new_mel;
-        if (!s->finished && new_mel > STREAM_CHUNK_NEW_MEL)
-            slice_end = s->mel_cursor + STREAM_CHUNK_NEW_MEL;
+        if (!s->finished && new_mel > s->chunk_new_mel)
+            slice_end = s->mel_cursor + s->chunk_new_mel;
         if (slice_end > total_mel) slice_end = total_mel;
         int slice_len = slice_end - slice_start;
 
         struct timeval t0, t1;
         gettimeofday(&t0, NULL);
 
-        int enc_len = 0;
-        float *enc_out = vox_encoder_forward(s->ctx,
-            mel_data + (size_t)slice_start * VOX_MEL_BINS,
-            slice_len, &enc_len);
-        if (!enc_out) break;
+        float *adapter_chunk = NULL;
+        int chunk_tokens = 0;
+        int used_cuda = 0;
 
-        int overlap_enc = actual_overlap_mel / 2;
-        int new_enc_len = enc_len - overlap_enc;
-        new_enc_len = (new_enc_len / 4) * 4;
+#ifdef USE_CUDA
+        if (vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
+                                    s->ctx,
+                                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                    slice_len,
+                                    actual_overlap_mel)) {
+            used_cuda = 1;
+        }
+#endif
 
-        if (new_enc_len > 0) {
-            int chunk_tokens = 0;
-            float *adapter_chunk = vox_adapter_forward(s->ctx,
-                enc_out + (size_t)overlap_enc * VOX_ENC_DIM,
-                new_enc_len, &chunk_tokens);
-            free(enc_out);
-            if (!adapter_chunk) break;
+        if (!used_cuda) {
+            /* Fallback: CPU encoder + adapter (matmuls may still be CUDA). */
+            int enc_len = 0;
+            float *enc_out = vox_encoder_forward(s->ctx,
+                mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                slice_len, &enc_len);
+            if (!enc_out) break;
 
-            gettimeofday(&t1, NULL);
-            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+            int overlap_enc = actual_overlap_mel / 2;
+            int new_enc_len = enc_len - overlap_enc;
+            new_enc_len = (new_enc_len / 4) * 4;
 
+            if (new_enc_len > 0) {
+                adapter_chunk = vox_adapter_forward(s->ctx,
+                    enc_out + (size_t)overlap_enc * VOX_ENC_DIM,
+                    new_enc_len, &chunk_tokens);
+                free(enc_out);
+                if (!adapter_chunk) break;
+            } else {
+                free(enc_out);
+                adapter_chunk = NULL;
+                chunk_tokens = 0;
+            }
+        }
+
+        gettimeofday(&t1, NULL);
+        s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                         (t1.tv_usec - t0.tv_usec) / 1000.0;
+
+        if (chunk_tokens > 0 && adapter_chunk) {
             if (s->total_adapter + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
                 while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
@@ -473,22 +503,15 @@ static void stream_run_encoder(vox_stream_t *s) {
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
             free(adapter_chunk);
             s->total_adapter += chunk_tokens;
-
-            if (vox_verbose >= 2)
-                fprintf(stderr, "  Chunk %d: mel [%d..%d) -> %d enc -> %d adapter (total: %d)\n",
-                        s->chunk_num, slice_start, slice_end, enc_len, chunk_tokens, s->total_adapter);
         } else {
-            free(enc_out);
-            gettimeofday(&t1, NULL);
-            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+            free(adapter_chunk);
         }
 
         s->mel_cursor = slice_end;
         s->chunk_num++;
 
         new_mel = total_mel - s->mel_cursor;
-        need_mel = STREAM_CHUNK_NEW_MEL;
+        need_mel = s->chunk_new_mel;
     }
 }
 
@@ -498,6 +521,7 @@ static void stream_run_decoder(vox_stream_t *s) {
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
+    const int eos_is_terminal = s->finished; /* EOS is only final once input is finished (offline right-pad added). */
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
@@ -516,6 +540,9 @@ static void stream_run_decoder(vox_stream_t *s) {
 
         s->ctx->kv_cache_len = 0;
         s->ctx->kv_pos_offset = 0;
+#ifdef USE_CUDA
+        vox_cuda_kv_cache_reset();
+#endif
         free(s->ctx->kv_cache_k); s->ctx->kv_cache_k = NULL;
         free(s->ctx->kv_cache_v); s->ctx->kv_cache_v = NULL;
 
@@ -526,7 +553,9 @@ static void stream_run_decoder(vox_stream_t *s) {
                (size_t)dim * sizeof(float));
         free(prompt_embeds);
 
-        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, s->logits);
+        /* Pass logits=NULL to avoid copying full vocab logits back to host on CUDA.
+         * The CPU fallback path will use ctx->dec_logits scratch space. */
+        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, NULL);
         s->n_generated++;
 
         /* Enqueue if it's a text token */
@@ -534,7 +563,15 @@ static void stream_run_decoder(vox_stream_t *s) {
             const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
             if (piece) stream_enqueue_token(s, piece);
         }
-        if (s->prev_token == TOKEN_EOS) s->eos_seen = 1;
+        if (s->prev_token == TOKEN_EOS) {
+            if (eos_is_terminal) {
+                s->eos_seen = 1;
+            } else {
+                /* In incremental/online mode we may see EOS at chunk boundaries.
+                 * Keep going by treating it as padding rather than final stop. */
+                s->prev_token = TOKEN_STREAMING_PAD;
+            }
+        }
 
         s->gen_pos = prompt_len;
         s->decoder_started = 1;
@@ -558,7 +595,7 @@ static void stream_run_decoder(vox_stream_t *s) {
             for (int j = 0; j < dim; j++)
                 s->step_embed[j] = a[j] + s->tok_tmp[j];
 
-            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, s->logits);
+            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, NULL);
             s->n_generated++;
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
@@ -567,7 +604,14 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
 
             s->gen_pos++;
-            if (s->prev_token == TOKEN_EOS) { s->eos_seen = 1; break; }
+            if (s->prev_token == TOKEN_EOS) {
+                if (eos_is_terminal) {
+                    s->eos_seen = 1;
+                    break;
+                }
+                /* Provisional EOS: continue decoding using padding token. */
+                s->prev_token = TOKEN_STREAMING_PAD;
+            }
         }
         if (s->n_generated > gen_before) {
             gettimeofday(&t1, NULL);
@@ -612,6 +656,24 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         return NULL;
     }
 
+    /* Encoder chunking defaults */
+    s->overlap_mel = OVERLAP_MEL;
+    s->chunk_new_mel = STREAM_CHUNK_NEW_MEL;
+    s->first_chunk_min_mel = STREAM_FIRST_CHUNK_MIN_MEL;
+
+    /* Optional offline tuning: increase chunk size to reduce overlap re-encode overhead.
+     * This trades latency for throughput (useful for long files). */
+    {
+        const char *v = getenv("VOX_STREAM_CHUNK_NEW_MEL");
+        if (v && v[0]) {
+            int n = atoi(v);
+            if (n >= 256 && n <= 32768) {
+                s->chunk_new_mel = n;
+                s->chunk_user_override = 1;
+            }
+        }
+    }
+
     return s;
 }
 
@@ -624,6 +686,16 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
     if (s->interval_samples == 0 ||
         s->samples_since_process >= s->interval_samples) {
+        /* Heuristic: if we are fed a large chunk (offline file or big pipe) and
+         * the user didn't explicitly choose a chunk size, increase chunk_new_mel
+         * so the encoder doesn't re-encode huge overlaps many times. */
+        if (!s->chunk_user_override && s->chunk_num == 0 &&
+            n_samples >= VOX_SAMPLE_RATE * 20) {
+            /* For long offline inputs, increase chunk size to reduce overlap re-encode
+             * overhead, but keep it bounded so encoder attention doesn't explode in
+             * time/memory (CUDA path materializes scores). */
+            s->chunk_new_mel = 4096;
+        }
         stream_run_encoder(s);
         stream_run_decoder(s);
         s->samples_since_process = 0;
@@ -664,7 +736,10 @@ int vox_stream_finish(vox_stream_t *s) {
     stream_run_encoder(s);
     stream_run_decoder(s);
 
-    if (vox_verbose >= 1) {
+    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
+    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
+
+    if (vox_verbose >= 1 || force_timing) {
         /* Ensure stdout transcription output ends with newline before timing */
         if (vox_stream_output) {
             fputs("\n", vox_stream_output);
@@ -886,6 +961,18 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx) {
 
     vox_stream_t *s = vox_stream_init(ctx);
     if (!s) return NULL;
+
+    /* Optional batching for stdin raw mode to reduce overhead when the input
+     * arrives in many small chunks (e.g. ffmpeg pipe). Default is 0 (process on
+     * every feed). */
+    {
+        const char *v = getenv("VOX_STDIN_INTERVAL_SEC");
+        if (v && v[0]) {
+            float sec = (float)atof(v);
+            if (sec < 0.0f) sec = 0.0f;
+            vox_set_processing_interval(s, sec);
+        }
+    }
 
     /* Feed the 4 peeked header bytes as 2 s16le samples */
     {
