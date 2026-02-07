@@ -116,6 +116,12 @@ cat recording.wav | ./voxtral -d voxtral-model --stdin
 
 `--stdin` and `-i` are mutually exclusive.
 
+If you are piping raw PCM and want to reduce overhead (process in larger chunks), you can set:
+
+```bash
+VOX_STDIN_INTERVAL_SEC=2 ./voxtral -d voxtral-model --stdin
+```
+
 To convert files to WAV format, just use `ffmpeg`:
 
     ffmpeg -i input.ogg output.wav
@@ -322,6 +328,7 @@ MIT
 ## CUDA on Windows 11 + WSL2 (Ubuntu)
 
 This repository now includes a CUDA backend that uses **cuBLAS** for large matrix multiplies (`make cuda`).
+The CUDA backend uses the CUDA **driver API** (`libcuda`) and does not require linking against `libcudart`.
 
 ### Prerequisites
 
@@ -337,7 +344,13 @@ make cuda
 make cuda CUDA_HOME=/usr/local/cuda
 ```
 
-The build now performs a preflight check for `cuda_runtime.h` under `${CUDA_HOME}/include`.
+The build now performs a preflight check for `cuda.h` + `cublas_v2.h` under `${CUDA_HOME}/include`.
+
+Optional (Linux): enable OpenMP for faster CPU-side kernels:
+
+```bash
+make cuda OPENMP=1
+```
 
 ### Verify CUDA visibility in WSL2
 
@@ -352,11 +365,11 @@ If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will o
 
 - Windows 11 with recent NVIDIA Game Ready or Studio driver that includes WSL CUDA support.
 - Ubuntu 22.04+ in WSL2.
-- CUDA toolkit 12.x in Ubuntu (`cuda_runtime.h`, `libcudart`, `libcublas`).
+- CUDA toolkit in Ubuntu (`cuda.h`, `libcublas`).
 
 ### Troubleshooting
 
-- `cuda_runtime.h not found`: install CUDA toolkit in Ubuntu and/or set `CUDA_HOME`.
+- `cuda.h not found`: install CUDA toolkit in Ubuntu and/or set `CUDA_HOME`.
 - `error while loading shared libraries: libcublas.so`: ensure `${CUDA_HOME}/lib64` is in linker path (or build with correct `CUDA_HOME`).
 - `nvidia-smi` fails in WSL2: update Windows NVIDIA driver and verify WSL GPU support is enabled.
 - OOM during long runs: reduce concurrent workloads and close GPU-intensive apps on host Windows.
@@ -400,6 +413,6 @@ If `pulse` is unavailable in your WSL distribution, use a host-side capture path
 ./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
 ```
 
-### Full migration handoff notes
+### CUDA / WSL2 Notes
 
-For end-to-end continuation guidance (status, remaining work, and step-by-step next actions on your WSL2 machine), see `HANDOFF_CUDA_WSL2.md`.
+For detailed bringup, benchmark results, and profiling notes, see `PR_NOTES_CUDA_WSL2.md`.
