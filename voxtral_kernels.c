@@ -354,7 +354,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
                        int channels_in, int channels_out, int length,
                        int kernel_size, int stride) {
     /* Matches vLLM WhisperCausalConv1d padding scheme.
-     * Uses im2col + BLAS sgemm for fast computation. */
+     * Uses im2col + matmul (CUDA/BLAS when available) for fast computation. */
     int padding_total = kernel_size - stride;
     float n_frames = ((float)length - kernel_size + padding_total) / (float)stride + 1.0f;
     int out_length = (int)ceilf(n_frames);
@@ -379,13 +379,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
     }
 
     /* out = weight × im2col: [channels_out, K] × [K, out_length] → [channels_out, out_length] */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                channels_out, out_length, K,
-                1.0f,
-                weight, K,
-                im2col, out_length,
-                0.0f,
-                out, out_length);
+    vox_matmul(out, weight, im2col, channels_out, K, out_length);
     free(im2col);
 
     /* Add bias */
