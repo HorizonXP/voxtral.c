@@ -33,7 +33,6 @@
 #define HOP_LENGTH   160
 #define WIN_LENGTH   400
 #define N_FFT        400
-#define FFT_SIZE     512              /* next power of 2 >= N_FFT */
 #define LOG_MEL_MAX  1.5f
 #define N_FREQ       (N_FFT / 2 + 1)    /* 201 bins (matches training) */
 
@@ -47,7 +46,7 @@ static uint32_t read_u32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] <
 
 /* Parse WAV data from a buffer. Returns mono float32 samples at 16kHz.
  * The caller keeps ownership of data. Returns NULL on error. */
-static float *parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_samples) {
+float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_samples) {
     if (file_size < 44 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
         fprintf(stderr, "parse_wav_buffer: not a valid WAV file\n");
         return NULL;
@@ -158,7 +157,7 @@ float *vox_load_wav(const char *path, int *out_n_samples) {
     }
     fclose(f);
 
-    float *samples = parse_wav_buffer(data, (size_t)file_size, out_n_samples);
+    float *samples = vox_parse_wav_buffer(data, (size_t)file_size, out_n_samples);
     free(data);
     return samples;
 }
@@ -193,7 +192,7 @@ float *vox_read_pcm_stdin(int *out_n_samples) {
     /* Auto-detect: WAV (RIFF header) or raw s16le */
     if (memcmp(buf, "RIFF", 4) == 0) {
         fprintf(stderr, "Detected WAV format on stdin\n");
-        float *samples = parse_wav_buffer(buf, size, out_n_samples);
+        float *samples = vox_parse_wav_buffer(buf, size, out_n_samples);
         free(buf);
         return samples;
     }
@@ -283,55 +282,6 @@ static float *build_mel_filters(void) {
 }
 
 /* ========================================================================
- * Radix-2 FFT (replaces O(n^2) DFT for power spectrum computation)
- * ======================================================================== */
-
-/* Precompute twiddle factors: tw[k] = exp(-2*pi*i*k/n) for k=0..n/2-1 */
-static void fft_init_twiddles(float *tw_re, float *tw_im, int n) {
-    for (int k = 0; k < n / 2; k++) {
-        float angle = -2.0f * (float)M_PI * (float)k / (float)n;
-        tw_re[k] = cosf(angle);
-        tw_im[k] = sinf(angle);
-    }
-}
-
-/* In-place radix-2 FFT. n must be a power of 2.
- * tw_re/tw_im: precomputed twiddle factors of size n/2. */
-static void fft_radix2(float *re, float *im, int n,
-                       const float *tw_re, const float *tw_im) {
-    /* Bit-reversal permutation */
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            float t;
-            t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-    }
-
-    /* Butterfly stages */
-    for (int len = 2; len <= n; len <<= 1) {
-        int half = len / 2;
-        int step = n / len;
-        for (int k = 0; k < n; k += len) {
-            for (int j = 0; j < half; j++) {
-                float wr = tw_re[j * step];
-                float wi = tw_im[j * step];
-                int u = k + j, v = u + half;
-                float tr = wr * re[v] - wi * im[v];
-                float ti = wr * im[v] + wi * re[v];
-                re[v] = re[u] - tr;
-                im[v] = im[u] - ti;
-                re[u] += tr;
-                im[u] += ti;
-            }
-        }
-    }
-}
-
-/* ========================================================================
  * Mel Spectrogram
  * ======================================================================== */
 
@@ -382,37 +332,41 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)WIN_LENGTH));
     }
 
-    /* Precompute FFT twiddle factors */
-    float tw_re[FFT_SIZE / 2], tw_im[FFT_SIZE / 2];
-    fft_init_twiddles(tw_re, tw_im, FFT_SIZE);
+    /* Precompute DFT cos/sin tables: [k * N_FFT + n] = cos/sin(2*pi*k*n/N_FFT) */
+    float *dft_cos = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    float *dft_sin = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    for (int k = 0; k < N_FREQ; k++) {
+        for (int n = 0; n < N_FFT; n++) {
+            float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N_FFT;
+            dft_cos[k * N_FFT + n] = cosf(angle);
+            dft_sin[k * N_FFT + n] = sinf(angle);
+        }
+    }
 
     /* Allocate output: [n_frames, N_MEL] */
     float *mel = (float *)calloc(n_frames * N_MEL, sizeof(float));
 
     /* Working buffers */
-    float fft_re[FFT_SIZE], fft_im[FFT_SIZE];
+    float windowed[N_FFT];
     float power[N_FREQ];
 
     /* Process each frame */
     for (int t = 0; t < n_frames; t++) {
         int start = t * HOP_LENGTH;
 
-        /* Windowed frame, zero-padded to FFT_SIZE */
-        for (int i = 0; i < WIN_LENGTH; i++)
-            fft_re[i] = padded[start + i] * window[i];
-        memset(fft_re + WIN_LENGTH, 0, (FFT_SIZE - WIN_LENGTH) * sizeof(float));
-        memset(fft_im, 0, FFT_SIZE * sizeof(float));
+        /* Windowed frame (N_FFT == WIN_LENGTH, no zero-padding needed) */
+        for (int i = 0; i < N_FFT; i++)
+            windowed[i] = padded[start + i] * window[i];
 
-        /* FFT -> interpolate back to N_FREQ DFT bins -> power spectrum.
-         * DFT bin k is at frequency k*Fs/N_FFT; FFT bin j at j*Fs/FFT_SIZE.
-         * Map: pos = k * FFT_SIZE / N_FFT, then linearly interpolate. */
-        fft_radix2(fft_re, fft_im, FFT_SIZE, tw_re, tw_im);
+        /* Direct DFT -> power spectrum (exact, no interpolation) */
         for (int k = 0; k < n_freqs; k++) {
-            float pos = (float)k * FFT_SIZE / (float)N_FFT;
-            int j = (int)pos;
-            float frac = pos - j;
-            float re = fft_re[j] + frac * (fft_re[j + 1] - fft_re[j]);
-            float im = fft_im[j] + frac * (fft_im[j + 1] - fft_im[j]);
+            float re = 0, im = 0;
+            const float *cos_row = dft_cos + k * N_FFT;
+            const float *sin_row = dft_sin + k * N_FFT;
+            for (int n = 0; n < N_FFT; n++) {
+                re += windowed[n] * cos_row[n];
+                im += windowed[n] * sin_row[n];
+            }
             power[k] = re * re + im * im;
         }
 
@@ -432,6 +386,8 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
         }
     }
 
+    free(dft_cos);
+    free(dft_sin);
     free(padded);
     free(mel_filters);
 
@@ -446,8 +402,8 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
 struct vox_mel_ctx {
     /* Precomputed tables (built once in init) */
     float *mel_filters;     /* [N_MEL * N_FREQ] */
-    float tw_re[FFT_SIZE / 2]; /* FFT twiddle factors */
-    float tw_im[FFT_SIZE / 2];
+    float *dft_cos;         /* [N_FREQ * N_FFT] DFT cos table */
+    float *dft_sin;         /* [N_FREQ * N_FFT] DFT sin table */
     float window[WIN_LENGTH];
 
     /* Padded audio sample buffer (growing).
@@ -469,7 +425,7 @@ struct vox_mel_ctx {
  * Each frame t needs samples[t*HOP_LENGTH .. t*HOP_LENGTH + WIN_LENGTH - 1]. */
 static int mel_compute_available(vox_mel_ctx_t *ctx) {
     int new_frames = 0;
-    float fft_re[FFT_SIZE], fft_im[FFT_SIZE];
+    float windowed[N_FFT];
     float power[N_FREQ];
 
     while (1) {
@@ -488,20 +444,19 @@ static int mel_compute_available(vox_mel_ctx_t *ctx) {
             ctx->mel_cap = new_cap;
         }
 
-        /* Windowed frame, zero-padded to FFT_SIZE */
-        for (int i = 0; i < WIN_LENGTH; i++)
-            fft_re[i] = ctx->samples[start + i] * ctx->window[i];
-        memset(fft_re + WIN_LENGTH, 0, (FFT_SIZE - WIN_LENGTH) * sizeof(float));
-        memset(fft_im, 0, FFT_SIZE * sizeof(float));
+        /* Windowed frame (N_FFT == WIN_LENGTH, no zero-padding needed) */
+        for (int i = 0; i < N_FFT; i++)
+            windowed[i] = ctx->samples[start + i] * ctx->window[i];
 
-        /* FFT -> interpolate back to N_FREQ DFT bins -> power spectrum */
-        fft_radix2(fft_re, fft_im, FFT_SIZE, ctx->tw_re, ctx->tw_im);
+        /* Direct DFT -> power spectrum (exact, no interpolation) */
         for (int k = 0; k < N_FREQ; k++) {
-            float pos = (float)k * FFT_SIZE / (float)N_FFT;
-            int j = (int)pos;
-            float frac = pos - j;
-            float re = fft_re[j] + frac * (fft_re[j + 1] - fft_re[j]);
-            float im = fft_im[j] + frac * (fft_im[j + 1] - fft_im[j]);
+            float re = 0, im = 0;
+            const float *cos_row = ctx->dft_cos + k * N_FFT;
+            const float *sin_row = ctx->dft_sin + k * N_FFT;
+            for (int n = 0; n < N_FFT; n++) {
+                re += windowed[n] * cos_row[n];
+                im += windowed[n] * sin_row[n];
+            }
             power[k] = re * re + im * im;
         }
 
@@ -534,8 +489,21 @@ vox_mel_ctx_t *vox_mel_ctx_init(int left_pad_samples) {
     ctx->mel_filters = build_mel_filters();
     if (!ctx->mel_filters) { free(ctx); return NULL; }
 
-    /* Precompute FFT twiddle factors */
-    fft_init_twiddles(ctx->tw_re, ctx->tw_im, FFT_SIZE);
+    /* Precompute DFT cos/sin tables */
+    ctx->dft_cos = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    ctx->dft_sin = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    if (!ctx->dft_cos || !ctx->dft_sin) {
+        free(ctx->dft_cos); free(ctx->dft_sin);
+        free(ctx->mel_filters); free(ctx);
+        return NULL;
+    }
+    for (int k = 0; k < N_FREQ; k++) {
+        for (int n = 0; n < N_FFT; n++) {
+            float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N_FFT;
+            ctx->dft_cos[k * N_FFT + n] = cosf(angle);
+            ctx->dft_sin[k * N_FFT + n] = sinf(angle);
+        }
+    }
 
     /* Periodic Hann window */
     for (int i = 0; i < WIN_LENGTH; i++) {
@@ -640,6 +608,8 @@ float *vox_mel_data(vox_mel_ctx_t *ctx, int *out_n_frames) {
 void vox_mel_free(vox_mel_ctx_t *ctx) {
     if (!ctx) return;
     free(ctx->mel_filters);
+    free(ctx->dft_cos);
+    free(ctx->dft_sin);
     free(ctx->samples);
     free(ctx->mel);
     free(ctx);

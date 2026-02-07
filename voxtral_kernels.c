@@ -353,28 +353,42 @@ void vox_conv1d(float *out, const float *in, const float *weight, const float *b
 void vox_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
                        int channels_in, int channels_out, int length,
                        int kernel_size, int stride) {
-    /* Matches vLLM WhisperCausalConv1d padding scheme. */
+    /* Matches vLLM WhisperCausalConv1d padding scheme.
+     * Uses im2col + matmul (CUDA/BLAS when available) for fast computation. */
     int padding_total = kernel_size - stride;
     float n_frames = ((float)length - kernel_size + padding_total) / (float)stride + 1.0f;
     int out_length = (int)ceilf(n_frames);
-    if (out_length < 0) out_length = 0;
+    if (out_length <= 0) return;
 
     int left_pad = padding_total;
+    int K = channels_in * kernel_size;
 
-    for (int oc = 0; oc < channels_out; oc++) {
-        float b = (bias != NULL) ? bias[oc] : 0.0f;
-        for (int ol = 0; ol < out_length; ol++) {
-            float sum = b;
-            for (int ic = 0; ic < channels_in; ic++) {
-                for (int k = 0; k < kernel_size; k++) {
-                    int il = ol * stride - left_pad + k;
-                    if (il >= 0 && il < length) {
-                        int w_idx = oc * channels_in * kernel_size + ic * kernel_size + k;
-                        sum += in[ic * length + il] * weight[w_idx];
-                    }
+    /* Build im2col matrix: [K, out_length] row-major.
+     * im2col[ic*kernel_size + k, ol] = in[ic, ol*stride - left_pad + k] (0 if OOB) */
+    float *im2col = (float *)calloc((size_t)K * out_length, sizeof(float));
+    for (int ol = 0; ol < out_length; ol++) {
+        for (int ic = 0; ic < channels_in; ic++) {
+            for (int k = 0; k < kernel_size; k++) {
+                int il = ol * stride - left_pad + k;
+                if (il >= 0 && il < length) {
+                    im2col[(size_t)(ic * kernel_size + k) * out_length + ol] =
+                        in[(size_t)ic * length + il];
                 }
             }
-            out[oc * out_length + ol] = sum;
+        }
+    }
+
+    /* out = weight × im2col: [channels_out, K] × [K, out_length] → [channels_out, out_length] */
+    vox_matmul(out, weight, im2col, channels_out, K, out_length);
+    free(im2col);
+
+    /* Add bias */
+    if (bias) {
+        for (int oc = 0; oc < channels_out; oc++) {
+            float b = bias[oc];
+            float *row = out + (size_t)oc * out_length;
+            for (int ol = 0; ol < out_length; ol++)
+                row[ol] += b;
         }
     }
 }

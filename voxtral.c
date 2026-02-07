@@ -26,9 +26,6 @@
 /* Global verbose flag */
 int vox_verbose = 0;
 
-/* Streaming output: when non-NULL, tokens are decoded and written here ASAP */
-FILE *vox_stream_output = NULL;
-
 /* ========================================================================
  * Decoder timing conditioning (t_cond + per-layer ada_scale)
  * ======================================================================== */
@@ -170,20 +167,25 @@ vox_ctx_t *vox_load(const char *model_dir) {
         if (vox_verbose >= 2)
             fprintf(stderr, "Pre-warming Metal weight cache...\n");
 
-        /* Encoder weights (32 layers) */
+        /* Encoder weights: merged QKV + merged w1+w3 (replaces individual caching)
+         * wo and w2 still cached individually. */
         for (int i = 0; i < VOX_ENC_LAYERS; i++) {
             vox_enc_layer_t *l = &ctx->encoder.layers[i];
             size_t enc_attn = (size_t)(VOX_ENC_HEADS * VOX_ENC_HEAD_DIM) * VOX_ENC_DIM;
             size_t enc_wo   = (size_t)VOX_ENC_DIM * (VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
             size_t enc_ffn1 = (size_t)VOX_ENC_HIDDEN * VOX_ENC_DIM;
             size_t enc_ffn2 = (size_t)VOX_ENC_DIM * VOX_ENC_HIDDEN;
-            vox_metal_warmup_bf16(l->wq_weight_bf16, enc_attn);
-            vox_metal_warmup_bf16(l->wk_weight_bf16, enc_attn);
-            vox_metal_warmup_bf16(l->wv_weight_bf16, enc_attn);
+            /* Merged QKV and w1+w3 (internally caches individual f16 buffers too) */
+            vox_metal_warmup_merged_3(
+                l->wq_weight_bf16, enc_attn,
+                l->wk_weight_bf16, enc_attn,
+                l->wv_weight_bf16, enc_attn);
+            vox_metal_warmup_merged_2(
+                l->w1_weight_bf16, enc_ffn1,
+                l->w3_weight_bf16, enc_ffn1);
+            /* wo and w2 used individually */
             vox_metal_warmup_bf16(l->wo_weight_bf16, enc_wo);
-            vox_metal_warmup_bf16(l->w1_weight_bf16, enc_ffn1);
             vox_metal_warmup_bf16(l->w2_weight_bf16, enc_ffn2);
-            vox_metal_warmup_bf16(l->w3_weight_bf16, enc_ffn1);
         }
 
         /* Adapter weights */
@@ -212,6 +214,29 @@ vox_ctx_t *vox_load(const char *model_dir) {
         /* Token embeddings (also used as logits projection) */
         vox_metal_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
                               (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
+
+        /* Pre-warm merged weight buffers for monolithic decoder step */
+        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+            vox_dec_layer_t *l = &ctx->decoder.layers[i];
+            /* Merged QKV = wq + wk + wv */
+            vox_metal_warmup_merged_3(
+                l->wq_weight_bf16, (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
+                l->wk_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
+                l->wv_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM);
+            /* Merged w1+w3 */
+            vox_metal_warmup_merged_2(
+                l->w1_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM,
+                l->w3_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM);
+        }
+
+        /* Pre-warm decoder MPS ops and f32 weight caches */
+        vox_metal_warmup_decoder_ops(ctx);
+
+        /* Pre-allocate KV cache (shared GPU memory) */
+        vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
+
+        /* Pre-allocate encoder KV cache (shared GPU memory for monolithic step) */
+        vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
 
         if (vox_verbose >= 1)
             fprintf(stderr, "Metal GPU: %.1f MB\n",
@@ -263,9 +288,35 @@ void vox_free(vox_ctx_t *ctx) {
 
     #undef FREE0
 
+#ifdef USE_METAL
+    vox_metal_shared_free(ctx->kv_cache_k);
+    vox_metal_shared_free(ctx->kv_cache_v);
+#else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+#endif
+#ifdef USE_METAL
+    if (ctx->enc_kv_cache_is_shared) {
+        vox_metal_shared_free(ctx->enc_kv_cache_k);
+        vox_metal_shared_free(ctx->enc_kv_cache_v);
+    } else
+#endif
+    {
+        free(ctx->enc_kv_cache_k);
+        free(ctx->enc_kv_cache_v);
+    }
     free(ctx->ada_scale);
+    free(ctx->enc_inc_x_norm);
+    free(ctx->enc_inc_q);
+    free(ctx->enc_inc_k);
+    free(ctx->enc_inc_v);
+    free(ctx->enc_inc_attn_out);
+    free(ctx->enc_inc_proj_out);
+    free(ctx->enc_inc_gate);
+    free(ctx->enc_inc_up);
+    free(ctx->enc_inc_ffn_out);
+    free(ctx->enc_inc_positions);
+    free(ctx->enc_inc_rope_freqs);
 
     /* Persistent decoder buffers */
     free(ctx->dec_x);
@@ -306,12 +357,17 @@ void vox_free(vox_ctx_t *ctx) {
 #define RAW_AUDIO_LENGTH_PER_TOK 1280
 #define OFFLINE_STREAMING_BUFFER_TOKENS 10
 
-/* Overlap in mel frames between encoder chunks (>= 750*2 for sliding window) */
-#define OVERLAP_MEL    1504
-/* New mel frames per chunk for streaming (~12.5 sec) */
-#define STREAM_CHUNK_NEW_MEL  2000
+/* Chunked encoder overlap (mel frames). Used by the CUDA full-encoder path which
+ * re-encodes overlap to provide sliding-window context. Must be >= 2*VOX_ENC_WINDOW. */
+#define OVERLAP_MEL (VOX_ENC_WINDOW * 2 + 4)
+/* New mel frames per chunk for the CUDA full-encoder path (throughput vs latency). */
+#define STREAM_CHUNK_NEW_MEL 2000
+
 /* First chunk minimum mel frames (enough for 39 prompt adapter tokens) */
 #define STREAM_FIRST_CHUNK_MIN_MEL  312
+
+/* Default processing interval in seconds (mel rate = 100 fps) */
+#define STREAM_DEFAULT_INTERVAL  2.0f
 
 static void trim_ascii_whitespace(char *s) {
     if (!s) return;
@@ -346,13 +402,26 @@ struct vox_stream {
     vox_mel_ctx_t *mel_ctx;
     int real_samples_fed;
 
-    /* Encoder chunk tracking */
+    /* Encoder progress in mel frames */
     int mel_cursor;
+
+    /* Chunked encoder state (used by CUDA full encoder path). */
     int chunk_num;
     int overlap_mel;
     int chunk_new_mel;
     int first_chunk_min_mel;
     int chunk_user_override;
+
+    /* Incremental conv stem state */
+    float *mel_tail;           /* [128 * 2] last 2 mel frames (column-major: [128, 2]) */
+    float *conv0_tail;         /* [1280 * 2] last 2 conv0 outputs consumed by conv1 */
+    float *conv0_residual;     /* [1280] 0 or 1 conv0 output pending stride alignment */
+    int conv0_residual_count;  /* 0 or 1 */
+    int conv_stem_initialized; /* 0 for first chunk */
+
+    /* Residual encoder positions for 4x downsample alignment */
+    float *enc_residual;       /* [1280 * 3] leftover positions */
+    int enc_residual_count;    /* 0-3 */
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
@@ -366,39 +435,47 @@ struct vox_stream {
     int eos_seen;
     int finished;       /* vox_stream_finish() called */
 
-    /* Pending token queue (circular buffer of const char* into tokenizer) */
-    const char **token_queue;
-    int queue_head;     /* next to read */
-    int queue_tail;     /* next to write */
-    int queue_cap;
+    /* Pending token queue (circular buffer, VOX_MAX_ALT strings per position) */
+    const char **token_queue;   /* [queue_cap * VOX_MAX_ALT] */
+    int queue_head;     /* next position to read */
+    int queue_tail;     /* next position to write */
+    int queue_cap;      /* capacity in token positions */
+
+    /* Alternative token settings */
+    int n_alt;           /* max alternatives to track (default 1 = no alternatives) */
+    float alt_cutoff;    /* max distance from top token (0.0-1.0) */
 
     /* Decoder working buffers */
     float *logits;
     float *step_embed;
     float *tok_tmp;
 
-    /* Processing interval: minimum samples between encoder/decoder runs */
-    int interval_samples;       /* 0 = process on every feed() */
-    int samples_since_process;
+    /* Processing interval: minimum new mel frames before encoder triggers */
+    int min_new_mel;            /* derived from interval in seconds (mel rate = 100 fps) */
 
     /* Timing */
     double encoder_ms;
     double decoder_ms;
+    double prefill_ms;
     int n_generated;
+    int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
 
-static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
+/* Enqueue one token position. alts[0]=best, alts[1..VOX_MAX_ALT-1]=alternatives or NULL. */
+static void stream_enqueue_token(vox_stream_t *s, const char *alts[VOX_MAX_ALT]) {
     /* Grow queue if full */
     int next_tail = (s->queue_tail + 1) % s->queue_cap;
     if (next_tail == s->queue_head) {
         int old_cap = s->queue_cap;
         int new_cap = old_cap * 2;
-        const char **new_q = (const char **)malloc((size_t)new_cap * sizeof(const char *));
+        const char **new_q = (const char **)calloc((size_t)new_cap * VOX_MAX_ALT, sizeof(const char *));
         if (!new_q) return;
         /* Copy old entries in order */
         int n = 0;
         for (int i = s->queue_head; i != s->queue_tail; i = (i + 1) % old_cap) {
-            new_q[n++] = s->token_queue[i];
+            memcpy(&new_q[n * VOX_MAX_ALT], &s->token_queue[i * VOX_MAX_ALT],
+                   VOX_MAX_ALT * sizeof(const char *));
+            n++;
         }
         free(s->token_queue);
         s->token_queue = new_q;
@@ -407,111 +484,483 @@ static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
         s->queue_cap = new_cap;
         next_tail = (s->queue_tail + 1) % s->queue_cap;
     }
-    s->token_queue[s->queue_tail] = piece;
+    memcpy(&s->token_queue[s->queue_tail * VOX_MAX_ALT], alts,
+           VOX_MAX_ALT * sizeof(const char *));
     s->queue_tail = next_tail;
-    if (vox_stream_output) {
-        fputs(piece, vox_stream_output);
-        fflush(vox_stream_output);
-    }
 }
 
-/* Run encoder chunks on available mel, append adapter tokens */
+/*
+ * Incremental conv stem: process new mel frames through conv0/conv1,
+ * using tail buffers for boundary correctness.
+ *
+ * Conv1 has stride=2, so we must feed it an even number of conv0 outputs
+ * to avoid right-side zero-padding that would corrupt the last output and
+ * shift stride alignment for all subsequent chunks. Any odd remainder is
+ * saved as conv0_residual and prepended to the next chunk.
+ *
+ * Returns a newly-allocated buffer of [*out_len, 1280] post-conv positions.
+ * Caller must free. Returns NULL if out_len == 0.
+ */
+static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
+                                int n_new_mel, int *out_len) {
+    vox_encoder_t *enc = &s->ctx->encoder;
+    int dim = VOX_ENC_DIM; /* 1280 */
+    *out_len = 0;
+
+    if (n_new_mel <= 0) return NULL;
+
+    int is_first = 0;
+
+    /* === Phase 1: Conv0 — produce new conv0 outputs [dim, conv0_new_len] === */
+    int conv0_new_len;
+    float *conv0_new; /* [dim, conv0_new_len] column-major, caller frees */
+
+    if (!s->conv_stem_initialized) {
+        is_first = 1;
+
+        /* Transpose mel [n_new_mel, 128] -> [128, n_new_mel] */
+        float *conv_in = (float *)malloc((size_t)VOX_MEL_BINS * n_new_mel * sizeof(float));
+        for (int f = 0; f < n_new_mel; f++)
+            for (int m = 0; m < VOX_MEL_BINS; m++)
+                conv_in[m * n_new_mel + f] = mel_new[f * VOX_MEL_BINS + m];
+
+        conv0_new_len = n_new_mel;
+        conv0_new = (float *)malloc((size_t)dim * conv0_new_len * sizeof(float));
+        vox_causal_conv1d(conv0_new, conv_in, enc->conv0_weight, enc->conv0_bias,
+                          VOX_MEL_BINS, dim, n_new_mel, 3, 1);
+        vox_gelu(conv0_new, dim * conv0_new_len);
+        free(conv_in);
+
+        /* Save last 2 mel frames (column-major [128, 2]) */
+        if (!s->mel_tail) s->mel_tail = (float *)calloc((size_t)VOX_MEL_BINS * 2, sizeof(float));
+        int ts = n_new_mel >= 2 ? n_new_mel - 2 : 0;
+        int tc = n_new_mel >= 2 ? 2 : n_new_mel;
+        memset(s->mel_tail, 0, (size_t)VOX_MEL_BINS * 2 * sizeof(float));
+        for (int f = 0; f < tc; f++)
+            for (int m = 0; m < VOX_MEL_BINS; m++)
+                s->mel_tail[m * 2 + (2 - tc + f)] = mel_new[(ts + f) * VOX_MEL_BINS + m];
+
+        s->conv_stem_initialized = 1;
+    } else {
+        /* Subsequent chunks: prepend mel_tail for conv0 boundary */
+        int padded_mel_len = 2 + n_new_mel;
+        float *conv_in = (float *)malloc((size_t)VOX_MEL_BINS * padded_mel_len * sizeof(float));
+        for (int m = 0; m < VOX_MEL_BINS; m++) {
+            conv_in[m * padded_mel_len + 0] = s->mel_tail[m * 2 + 0];
+            conv_in[m * padded_mel_len + 1] = s->mel_tail[m * 2 + 1];
+            for (int f = 0; f < n_new_mel; f++)
+                conv_in[m * padded_mel_len + 2 + f] = mel_new[f * VOX_MEL_BINS + m];
+        }
+
+        float *conv0_full = (float *)malloc((size_t)dim * padded_mel_len * sizeof(float));
+        vox_causal_conv1d(conv0_full, conv_in, enc->conv0_weight, enc->conv0_bias,
+                          VOX_MEL_BINS, dim, padded_mel_len, 3, 1);
+        vox_gelu(conv0_full, dim * padded_mel_len);
+        free(conv_in);
+
+        /* Discard first 2 (from overlap, contaminated by zero-pad) */
+        conv0_new_len = n_new_mel;
+        conv0_new = (float *)malloc((size_t)dim * conv0_new_len * sizeof(float));
+        for (int d = 0; d < dim; d++)
+            memcpy(conv0_new + (size_t)d * conv0_new_len,
+                   conv0_full + (size_t)d * padded_mel_len + 2,
+                   (size_t)conv0_new_len * sizeof(float));
+        free(conv0_full);
+
+        /* Update mel_tail */
+        int ts = n_new_mel >= 2 ? n_new_mel - 2 : 0;
+        int tc = n_new_mel >= 2 ? 2 : n_new_mel;
+        memset(s->mel_tail, 0, (size_t)VOX_MEL_BINS * 2 * sizeof(float));
+        for (int f = 0; f < tc; f++)
+            for (int m = 0; m < VOX_MEL_BINS; m++)
+                s->mel_tail[m * 2 + (2 - tc + f)] = mel_new[(ts + f) * VOX_MEL_BINS + m];
+    }
+
+    /* === Phase 2: Stride alignment — ensure even count for conv1 === */
+    int prev_res = s->conv0_residual_count;
+    int total_avail = prev_res + conv0_new_len;
+    int new_res = total_avail & 1; /* 1 if odd, 0 if even */
+    int feed_from_new = conv0_new_len - new_res;
+    int feed_total = prev_res + feed_from_new; /* always even */
+
+    if (feed_total <= 0) {
+        /* Not enough to feed conv1 — just save residual */
+        if (new_res && conv0_new_len > 0) {
+            if (!s->conv0_residual)
+                s->conv0_residual = (float *)malloc((size_t)dim * sizeof(float));
+            for (int d = 0; d < dim; d++)
+                s->conv0_residual[d] = conv0_new[(size_t)d * conv0_new_len + conv0_new_len - 1];
+        }
+        s->conv0_residual_count = new_res;
+        free(conv0_new);
+        return NULL;
+    }
+
+    /* Build feed buffer [dim, feed_total] column-major */
+    float *feed = (float *)malloc((size_t)dim * feed_total * sizeof(float));
+    int fpos = 0;
+
+    /* Copy old residual first (before overwriting with new) */
+    if (prev_res == 1) {
+        for (int d = 0; d < dim; d++)
+            feed[(size_t)d * feed_total + 0] = s->conv0_residual[d];
+        fpos = 1;
+    }
+
+    /* Copy feed_from_new values from conv0_new */
+    for (int d = 0; d < dim; d++)
+        memcpy(feed + (size_t)d * feed_total + fpos,
+               conv0_new + (size_t)d * conv0_new_len,
+               (size_t)feed_from_new * sizeof(float));
+
+    /* Save new residual (last value of conv0_new) if total was odd */
+    if (new_res) {
+        if (!s->conv0_residual)
+            s->conv0_residual = (float *)malloc((size_t)dim * sizeof(float));
+        for (int d = 0; d < dim; d++)
+            s->conv0_residual[d] = conv0_new[(size_t)d * conv0_new_len + conv0_new_len - 1];
+    }
+    s->conv0_residual_count = new_res;
+    free(conv0_new);
+
+    /* === Phase 3: Conv1 === */
+    float *conv1_in;
+    int conv1_in_len;
+    int conv1_discard; /* outputs to discard at front */
+
+    if (is_first) {
+        /* First chunk: zero left-pad is correct for start of sequence */
+        conv1_in = feed; /* aliased, freed after conv1 */
+        conv1_in_len = feed_total;
+        conv1_discard = 0;
+    } else {
+        /* Subsequent: prepend conv0_tail (2 frames) for boundary context */
+        conv1_in_len = 2 + feed_total;
+        conv1_in = (float *)malloc((size_t)dim * conv1_in_len * sizeof(float));
+        for (int d = 0; d < dim; d++) {
+            conv1_in[(size_t)d * conv1_in_len + 0] = s->conv0_tail[d * 2 + 0];
+            conv1_in[(size_t)d * conv1_in_len + 1] = s->conv0_tail[d * 2 + 1];
+            memcpy(conv1_in + (size_t)d * conv1_in_len + 2,
+                   feed + (size_t)d * feed_total,
+                   (size_t)feed_total * sizeof(float));
+        }
+        conv1_discard = 1;
+    }
+
+    /* Update conv0_tail from last 2 of feed (before freeing feed) */
+    if (!s->conv0_tail) s->conv0_tail = (float *)calloc((size_t)dim * 2, sizeof(float));
+    for (int d = 0; d < dim; d++) {
+        s->conv0_tail[d * 2 + 0] = feed[(size_t)d * feed_total + feed_total - 2];
+        s->conv0_tail[d * 2 + 1] = feed[(size_t)d * feed_total + feed_total - 1];
+    }
+    if (!is_first) free(feed);
+
+    /* conv1_in_len is always even → conv1 output count = conv1_in_len / 2 */
+    int conv1_out_len = conv1_in_len / 2;
+    float *conv1_out = (float *)malloc((size_t)dim * conv1_out_len * sizeof(float));
+    vox_causal_conv1d(conv1_out, conv1_in, enc->conv1_weight, enc->conv1_bias,
+                      dim, dim, conv1_in_len, 3, 2);
+    vox_gelu(conv1_out, dim * conv1_out_len);
+    if (is_first) free(feed); /* was aliased to conv1_in */
+    else free(conv1_in);
+
+    int result_len = conv1_out_len - conv1_discard;
+    if (result_len <= 0) {
+        free(conv1_out);
+        return NULL;
+    }
+
+    /* Transpose [dim, result_len] -> [result_len, dim] (row-major) */
+    float *result = (float *)malloc((size_t)result_len * dim * sizeof(float));
+    for (int si = 0; si < result_len; si++)
+        for (int d = 0; d < dim; d++)
+            result[(size_t)si * dim + d] = conv1_out[(size_t)d * conv1_out_len + conv1_discard + si];
+    free(conv1_out);
+
+    *out_len = result_len;
+    return result;
+}
+
+/* Return non-zero if we should use the CUDA full encoder+adapter path.
+ * This path is chunked (re-encodes overlap) and prioritizes throughput. */
+static int stream_use_cuda_encoder_full(void) {
+#ifdef USE_CUDA
+    static int cached = -1;
+    if (cached != -1) return cached;
+
+    const char *disable = getenv("VOX_DISABLE_CUDA_ENCODER_FULL");
+    if (disable && disable[0] && disable[0] != '0') {
+        cached = 0;
+        return cached;
+    }
+    cached = vox_cuda_available();
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+/* Run encoder on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
     float *mel_data = vox_mel_data(s->mel_ctx, &total_mel);
     int dim = VOX_DEC_DIM;
 
     int new_mel = total_mel - s->mel_cursor;
-    int need_mel = (s->chunk_num == 0) ? s->first_chunk_min_mel : s->chunk_new_mel;
 
-    while (new_mel >= need_mel || (s->finished && new_mel > 0)) {
-        int overlap = (s->chunk_num == 0) ? 0 : s->overlap_mel;
-        int slice_start = s->mel_cursor - overlap;
-        int actual_overlap_mel;
-        if (slice_start < 0) {
-            /* Overlap reaches back to beginning — discard previous partial
-             * results and re-encode from scratch as a single pass. */
-            slice_start = 0;
-            actual_overlap_mel = 0;
-            s->total_adapter = 0;
-        } else {
-            actual_overlap_mel = s->mel_cursor - slice_start;
-        }
-        int slice_end = s->mel_cursor + new_mel;
-        if (!s->finished && new_mel > s->chunk_new_mel)
-            slice_end = s->mel_cursor + s->chunk_new_mel;
-        if (slice_end > total_mel) slice_end = total_mel;
-        int slice_len = slice_end - slice_start;
+    /* CUDA full encoder+adapter path: chunked re-encode with overlap. */
+    if (stream_use_cuda_encoder_full()) {
+        int need_mel = (s->chunk_num == 0) ? s->first_chunk_min_mel : s->chunk_new_mel;
 
-        struct timeval t0, t1;
-        gettimeofday(&t0, NULL);
+        while (new_mel >= need_mel || (s->finished && new_mel > 0)) {
+            int overlap = (s->chunk_num == 0) ? 0 : s->overlap_mel;
+            int slice_start = s->mel_cursor - overlap;
+            int actual_overlap_mel;
+            if (slice_start < 0) {
+                /* Overlap reaches back to beginning — discard previous partial
+                 * results and re-encode from scratch as a single pass. */
+                slice_start = 0;
+                actual_overlap_mel = 0;
+                s->total_adapter = 0;
+            } else {
+                actual_overlap_mel = s->mel_cursor - slice_start;
+            }
 
-        float *adapter_chunk = NULL;
-        int chunk_tokens = 0;
-        int used_cuda = 0;
+            int slice_end = s->mel_cursor + new_mel;
+            if (!s->finished && new_mel > s->chunk_new_mel)
+                slice_end = s->mel_cursor + s->chunk_new_mel;
+            if (slice_end > total_mel) slice_end = total_mel;
 
+            int slice_len = slice_end - slice_start;
+            if (slice_len <= 0) break;
+
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
+
+            float *adapter_chunk = NULL;
+            int chunk_tokens = 0;
+
+            int used_cuda = 0;
 #ifdef USE_CUDA
-        if (vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
-                                    s->ctx,
-                                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
-                                    slice_len,
-                                    actual_overlap_mel)) {
-            used_cuda = 1;
-        }
+            used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
+                                                s->ctx,
+                                                mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                                slice_len,
+                                                actual_overlap_mel);
 #endif
 
-        if (!used_cuda) {
-            /* Fallback: CPU encoder + adapter (matmuls may still be CUDA). */
-            int enc_len = 0;
-            float *enc_out = vox_encoder_forward(s->ctx,
-                mel_data + (size_t)slice_start * VOX_MEL_BINS,
-                slice_len, &enc_len);
-            if (!enc_out) break;
+            if (!used_cuda) {
+                /* Fallback: CPU encoder + adapter (matmuls may still be CUDA). */
+                int enc_len = 0;
+                float *enc_out = vox_encoder_forward(s->ctx,
+                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                    slice_len, &enc_len);
+                if (!enc_out) break;
+
+                int overlap_enc = actual_overlap_mel / 2;
+                int new_enc_len = enc_len - overlap_enc;
+                new_enc_len = (new_enc_len / VOX_DOWNSAMPLE) * VOX_DOWNSAMPLE;
+
+                if (new_enc_len > 0) {
+                    adapter_chunk = vox_adapter_forward(s->ctx,
+                        enc_out + (size_t)overlap_enc * VOX_ENC_DIM,
+                        new_enc_len, &chunk_tokens);
+                } else {
+                    chunk_tokens = 0;
+                }
+
+                free(enc_out);
+                if (new_enc_len > 0 && !adapter_chunk) break;
+            }
 
             int overlap_enc = actual_overlap_mel / 2;
             int new_enc_len = enc_len - overlap_enc;
             new_enc_len = (new_enc_len / 4) * 4;
 
-            if (new_enc_len > 0) {
-                adapter_chunk = vox_adapter_forward(s->ctx,
-                    enc_out + (size_t)overlap_enc * VOX_ENC_DIM,
-                    new_enc_len, &chunk_tokens);
-                free(enc_out);
-                if (!adapter_chunk) break;
-            } else {
-                free(enc_out);
-                adapter_chunk = NULL;
-                chunk_tokens = 0;
+            if (chunk_tokens > 0 && adapter_chunk) {
+                if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+                    int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
+                    while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                    float *tmp = (float *)realloc(s->adapter_buf,
+                        (size_t)new_cap * dim * sizeof(float));
+                    if (!tmp) { free(adapter_chunk); return; }
+                    s->adapter_buf = tmp;
+                    s->adapter_cap = new_cap;
+                }
+                memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+                       adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
+                s->total_adapter += chunk_tokens;
             }
+            free(adapter_chunk);
+
+            s->mel_cursor = slice_end;
+            s->chunk_num++;
+
+            new_mel = total_mel - s->mel_cursor;
+            need_mel = s->chunk_new_mel;
+        }
+        return;
+    }
+
+    /* Default: incremental conv stem + incremental transformer KV cache. */
+    int need_mel = (!s->conv_stem_initialized) ? STREAM_FIRST_CHUNK_MIN_MEL : s->min_new_mel;
+
+    if (new_mel < need_mel && !s->finished) return;
+    if (new_mel <= 0) return;
+
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+
+    /* 1. Run incremental conv stem on new mel -> post-conv positions */
+    int conv_out_len = 0;
+    float *conv_out = stream_conv_stem(s, mel_data + (size_t)s->mel_cursor * VOX_MEL_BINS,
+                                        new_mel, &conv_out_len);
+    s->mel_cursor = total_mel;
+
+    if (!conv_out || conv_out_len <= 0) {
+        free(conv_out);
+        return;
+    }
+
+    /* 2. Run incremental encoder transformer with KV cache */
+    int enc_out_len = 0;
+    float *enc_out = vox_encoder_forward_incremental(s->ctx, conv_out, conv_out_len, &enc_out_len);
+    free(conv_out);
+
+    if (!enc_out || enc_out_len <= 0) {
+        free(enc_out);
+        return;
+    }
+
+    /* 3. Combine with residual, align to 4x for downsample */
+    int total_enc = s->enc_residual_count + enc_out_len;
+    int usable = (total_enc / VOX_DOWNSAMPLE) * VOX_DOWNSAMPLE;
+    int leftover = total_enc - usable;
+
+    if (usable > 0) {
+        /* Build a combined buffer: residual + new encoder output */
+        float *combined = (float *)malloc((size_t)usable * VOX_ENC_DIM * sizeof(float));
+        int pos = 0;
+
+        /* Copy residual positions first */
+        if (s->enc_residual_count > 0 && s->enc_residual) {
+            int from_residual = s->enc_residual_count;
+            if (from_residual > usable) from_residual = usable;
+            memcpy(combined, s->enc_residual, (size_t)from_residual * VOX_ENC_DIM * sizeof(float));
+            pos = from_residual;
         }
 
-        gettimeofday(&t1, NULL);
-        s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                         (t1.tv_usec - t0.tv_usec) / 1000.0;
+        /* Copy from new encoder output */
+        int from_enc = usable - pos;
+        if (from_enc > 0) {
+            memcpy(combined + (size_t)pos * VOX_ENC_DIM,
+                   enc_out, (size_t)from_enc * VOX_ENC_DIM * sizeof(float));
+        }
 
-        if (chunk_tokens > 0 && adapter_chunk) {
+        /* Run adapter on usable positions */
+        int chunk_tokens = 0;
+        float *adapter_chunk = vox_adapter_forward(s->ctx, combined, usable, &chunk_tokens);
+        free(combined);
+
+        if (adapter_chunk && chunk_tokens > 0) {
+            /* Append to adapter buffer */
             if (s->total_adapter + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
                 while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
-                if (!tmp) { free(adapter_chunk); break; }
+                if (!tmp) { free(adapter_chunk); free(enc_out); return; }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
             memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
-            free(adapter_chunk);
             s->total_adapter += chunk_tokens;
+            free(adapter_chunk);
         } else {
             free(adapter_chunk);
         }
+    }
 
-        s->mel_cursor = slice_end;
-        s->chunk_num++;
+    /* 4. Save leftover encoder positions to residual */
+    if (leftover > 0) {
+        if (!s->enc_residual)
+            s->enc_residual = (float *)malloc(3 * VOX_ENC_DIM * sizeof(float));
+        /* The leftover comes from the end of enc_out (after what we used from enc_out) */
+        int enc_used = usable - s->enc_residual_count;
+        if (enc_used < 0) enc_used = 0;
+        memcpy(s->enc_residual, enc_out + (size_t)enc_used * VOX_ENC_DIM,
+               (size_t)leftover * VOX_ENC_DIM * sizeof(float));
+    }
+    s->enc_residual_count = leftover;
 
-        new_mel = total_mel - s->mel_cursor;
-        need_mel = s->chunk_new_mel;
+    free(enc_out);
+
+    gettimeofday(&t1, NULL);
+    s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                     (t1.tv_usec - t0.tv_usec) / 1000.0;
+
+    if (vox_verbose >= 2)
+        fprintf(stderr, "  Encoder inc: %d mel -> %d conv -> %d usable (total adapter: %d, residual: %d)\n",
+                new_mel, conv_out_len, usable, s->total_adapter, leftover);
+}
+
+/* Build alternatives array from logits. alts[0]=best (already decoded as best_token).
+ * Fills alts[1..] with qualifying alternatives. */
+static void stream_fill_alts(vox_stream_t *s, int best_token,
+                              const char *alts[VOX_MAX_ALT]) {
+    memset(alts, 0, VOX_MAX_ALT * sizeof(const char *));
+    alts[0] = vox_tokenizer_decode(s->tokenizer, best_token);
+
+    if (s->n_alt <= 1) return;
+
+    /* Softmax over logits to get probabilities */
+    float *logits = s->logits;
+    float max_val = logits[0];
+    for (int i = 1; i < VOX_VOCAB_SIZE; i++)
+        if (logits[i] > max_val) max_val = logits[i];
+
+    float sum = 0;
+    for (int i = 0; i < VOX_VOCAB_SIZE; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < VOX_VOCAB_SIZE; i++)
+        logits[i] *= inv_sum;
+
+    float best_prob = logits[best_token];
+    if (best_prob <= 0) return;
+
+    /* Find top alternatives by repeated scan (n_alt is small, <=4) */
+    int found = 1; /* alts[0] already set */
+    int used[VOX_MAX_ALT];
+    used[0] = best_token;
+
+    while (found < s->n_alt) {
+        int best_idx = -1;
+        float best_p = -1;
+        for (int i = 1000; i < VOX_VOCAB_SIZE; i++) {
+            if (i == best_token) continue;
+            /* Skip already-picked */
+            int skip = 0;
+            for (int j = 1; j < found; j++)
+                if (used[j] == i) { skip = 1; break; }
+            if (skip) continue;
+
+            if (logits[i] > best_p) {
+                best_p = logits[i];
+                best_idx = i;
+            }
+        }
+        if (best_idx < 0) break;
+
+        float r = 1.0f - best_p / best_prob;
+        if (r > s->alt_cutoff) break;
+
+        used[found] = best_idx;
+        alts[found] = vox_tokenizer_decode(s->tokenizer, best_idx);
+        found++;
     }
 }
 
@@ -522,6 +971,7 @@ static void stream_run_decoder(vox_stream_t *s) {
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
     const int eos_is_terminal = s->finished; /* EOS is only final once input is finished (offline right-pad added). */
+    float *logits_out = (s->n_alt > 1) ? s->logits : NULL;
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
@@ -543,8 +993,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 #ifdef USE_CUDA
         vox_cuda_kv_cache_reset();
 #endif
-        free(s->ctx->kv_cache_k); s->ctx->kv_cache_k = NULL;
-        free(s->ctx->kv_cache_v); s->ctx->kv_cache_v = NULL;
+        /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it. */
 
         int prefill_count = prompt_len - 1;
         vox_decoder_prefill(s->ctx, prompt_embeds, prefill_count);
@@ -553,15 +1002,16 @@ static void stream_run_decoder(vox_stream_t *s) {
                (size_t)dim * sizeof(float));
         free(prompt_embeds);
 
-        /* Pass logits=NULL to avoid copying full vocab logits back to host on CUDA.
-         * The CPU fallback path will use ctx->dec_logits scratch space. */
-        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, NULL);
+        /* If alternatives are disabled, pass logits=NULL to avoid copying
+         * full-vocab logits back to host on CUDA. */
+        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
         s->n_generated++;
 
         /* Enqueue if it's a text token */
         if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
-            const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-            if (piece) stream_enqueue_token(s, piece);
+            const char *alts[VOX_MAX_ALT];
+            stream_fill_alts(s, s->prev_token, alts);
+            if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
         }
         if (s->prev_token == TOKEN_EOS) {
             if (eos_is_terminal) {
@@ -577,8 +1027,10 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->decoder_started = 1;
 
         gettimeofday(&t1, NULL);
-        s->decoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                         (t1.tv_usec - t0.tv_usec) / 1000.0;
+        double pf_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                       (t1.tv_usec - t0.tv_usec) / 1000.0;
+        s->decoder_ms += pf_ms;
+        s->prefill_ms += pf_ms;
 
         if (vox_verbose >= 2)
             fprintf(stderr, "Decoder started (prefill %d, first token: %d)\n",
@@ -595,12 +1047,13 @@ static void stream_run_decoder(vox_stream_t *s) {
             for (int j = 0; j < dim; j++)
                 s->step_embed[j] = a[j] + s->tok_tmp[j];
 
-            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, NULL);
+            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
             s->n_generated++;
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
-                const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-                if (piece) stream_enqueue_token(s, piece);
+                const char *alts[VOX_MAX_ALT];
+                stream_fill_alts(s, s->prev_token, alts);
+                if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
             }
 
             s->gen_pos++;
@@ -641,9 +1094,10 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         return NULL;
     }
 
-    /* Token queue */
+    /* Token queue (VOX_MAX_ALT strings per position) */
     s->queue_cap = 256;
-    s->token_queue = (const char **)malloc((size_t)s->queue_cap * sizeof(const char *));
+    s->token_queue = (const char **)calloc((size_t)s->queue_cap * VOX_MAX_ALT, sizeof(const char *));
+    s->n_alt = 1;
 
     /* Decoder working buffers */
     int dim = VOX_DEC_DIM;
@@ -656,7 +1110,14 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         return NULL;
     }
 
-    /* Encoder chunking defaults */
+    /* Reset encoder KV cache for new transcription */
+    ctx->enc_kv_cache_len = 0;
+    ctx->enc_kv_pos_offset = 0;
+
+    /* Default processing interval: 2 seconds (200 mel frames) */
+    s->min_new_mel = (int)(STREAM_DEFAULT_INTERVAL * 100.0f);
+
+    /* Chunked encoder defaults (used by CUDA full encoder path). */
     s->overlap_mel = OVERLAP_MEL;
     s->chunk_new_mel = STREAM_CHUNK_NEW_MEL;
     s->first_chunk_min_mel = STREAM_FIRST_CHUNK_MIN_MEL;
@@ -682,24 +1143,9 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
     vox_mel_feed(s->mel_ctx, samples, n_samples);
     s->real_samples_fed += n_samples;
-    s->samples_since_process += n_samples;
 
-    if (s->interval_samples == 0 ||
-        s->samples_since_process >= s->interval_samples) {
-        /* Heuristic: if we are fed a large chunk (offline file or big pipe) and
-         * the user didn't explicitly choose a chunk size, increase chunk_new_mel
-         * so the encoder doesn't re-encode huge overlaps many times. */
-        if (!s->chunk_user_override && s->chunk_num == 0 &&
-            n_samples >= VOX_SAMPLE_RATE * 20) {
-            /* For long offline inputs, increase chunk size to reduce overlap re-encode
-             * overhead, but keep it bounded so encoder attention doesn't explode in
-             * time/memory (CUDA path materializes scores). */
-            s->chunk_new_mel = 4096;
-        }
-        stream_run_encoder(s);
-        stream_run_decoder(s);
-        s->samples_since_process = 0;
-    }
+    stream_run_encoder(s);
+    stream_run_decoder(s);
     return 0;
 }
 
@@ -735,22 +1181,6 @@ int vox_stream_finish(vox_stream_t *s) {
     /* Process remaining encoder chunks and generate remaining tokens */
     stream_run_encoder(s);
     stream_run_decoder(s);
-
-    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
-    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
-
-    if (vox_verbose >= 1 || force_timing) {
-        /* Ensure stdout transcription output ends with newline before timing */
-        if (vox_stream_output) {
-            fputs("\n", vox_stream_output);
-            fflush(vox_stream_output);
-        }
-        fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
-                s->mel_cursor, s->total_adapter, s->encoder_ms);
-        if (s->n_generated > 0)
-            fprintf(stderr, "Decoder: %d tokens in %.0f ms (%.1f ms/token)\n",
-                    s->n_generated, s->decoder_ms, s->decoder_ms / s->n_generated);
-    }
     return 0;
 }
 
@@ -758,7 +1188,33 @@ int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max) {
     if (!s || max <= 0) return 0;
     int count = 0;
     while (count < max && s->queue_head != s->queue_tail) {
-        out_tokens[count++] = s->token_queue[s->queue_head];
+        out_tokens[count++] = s->token_queue[s->queue_head * VOX_MAX_ALT];
+        s->queue_head = (s->queue_head + 1) % s->queue_cap;
+    }
+    return count;
+}
+
+void vox_stream_set_alt(vox_stream_t *s, int n_alt, float cutoff) {
+    if (!s) return;
+    if (n_alt < 1) n_alt = 1;
+    if (n_alt > VOX_MAX_ALT) n_alt = VOX_MAX_ALT;
+    if (cutoff < 0) cutoff = 0;
+    if (cutoff > 1) cutoff = 1;
+    s->n_alt = n_alt;
+    s->alt_cutoff = cutoff;
+}
+
+int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
+                       int max_tokens, int n_alt) {
+    if (!s || max_tokens <= 0 || n_alt <= 0) return 0;
+    if (n_alt > VOX_MAX_ALT) n_alt = VOX_MAX_ALT;
+    int count = 0;
+    while (count < max_tokens && s->queue_head != s->queue_tail) {
+        const char **src = &s->token_queue[s->queue_head * VOX_MAX_ALT];
+        const char **dst = &out_tokens[count * n_alt];
+        for (int a = 0; a < n_alt; a++)
+            dst[a] = src[a];
+        count++;
         s->queue_head = (s->queue_head + 1) % s->queue_cap;
     }
     return count;
@@ -766,6 +1222,23 @@ int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max) {
 
 void vox_stream_free(vox_stream_t *s) {
     if (!s) return;
+
+    /* Print stats after caller has drained all tokens */
+    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
+    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
+    if (vox_verbose >= 1 || force_timing) {
+        fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
+                s->mel_cursor, s->total_adapter, s->encoder_ms);
+        if (s->n_text_tokens > 0) {
+            double gen_ms = s->decoder_ms - s->prefill_ms;
+            fprintf(stderr, "Decoder: %d text tokens (%d steps) in %.0f ms "
+                    "(prefill %.0f ms + %.1f ms/step)\n",
+                    s->n_text_tokens, s->n_generated, s->decoder_ms,
+                    s->prefill_ms,
+                    s->n_generated > 1 ? gen_ms / (s->n_generated - 1) : 0);
+        }
+    }
+
     vox_mel_free(s->mel_ctx);
     if (s->tokenizer) vox_tokenizer_free(s->tokenizer);
     free(s->adapter_buf);
@@ -773,6 +1246,10 @@ void vox_stream_free(vox_stream_t *s) {
     free(s->logits);
     free(s->step_embed);
     free(s->tok_tmp);
+    free(s->mel_tail);
+    free(s->conv0_tail);
+    free(s->conv0_residual);
+    free(s->enc_residual);
     free(s);
 }
 
@@ -1044,8 +1521,10 @@ char *vox_transcribe(vox_ctx_t *ctx, const char *wav_path) {
 
 void vox_set_processing_interval(vox_stream_t *s, float seconds) {
     if (!s) return;
-    s->interval_samples = (int)(seconds * VOX_SAMPLE_RATE);
-    if (s->interval_samples < 0) s->interval_samples = 0;
+    if (seconds <= 0) seconds = 0;
+    /* mel rate = sample_rate / hop_length = 16000/160 = 100 fps */
+    s->min_new_mel = (int)(seconds * 100.0f);
+    if (s->min_new_mel < 1) s->min_new_mel = 1;
 }
 
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms) {

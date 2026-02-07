@@ -177,6 +177,22 @@ typedef struct {
     /* BF16 direct mmap mode (weights stay as bf16, convert on-the-fly) */
     int use_bf16;
 
+    /* Encoder KV cache (rolling: compacted at window=750) */
+    float *enc_kv_cache_k;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
+    float *enc_kv_cache_v;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
+    int enc_kv_cache_len;     /* physical cache length */
+    int enc_kv_cache_max;     /* allocated capacity */
+    int enc_kv_cache_is_shared; /* allocated with vox_metal_shared_alloc */
+    int enc_kv_pos_offset;    /* logical offset from rolling compaction */
+
+    /* Persistent incremental-encoder scratch (allocated/grown on demand). */
+    int enc_inc_cap;          /* max new_len supported by buffers below */
+    float *enc_inc_x_norm, *enc_inc_q, *enc_inc_k, *enc_inc_v;
+    float *enc_inc_attn_out, *enc_inc_proj_out;
+    float *enc_inc_gate, *enc_inc_up, *enc_inc_ffn_out;
+    int *enc_inc_positions;
+    float *enc_inc_rope_freqs;
+
     /* Persistent single-token decoder buffers (allocated on first forward) */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
     float *dec_attn_out, *dec_proj_out;
@@ -186,13 +202,14 @@ typedef struct {
 } vox_ctx_t;
 
 /* ========================================================================
- * API Functions
+ * Alternative Tokens
  * ======================================================================== */
 
-/* Streaming output destination for convenience functions (vox_transcribe_stdin).
- * When non-NULL, tokens are written here as they are generated.
- * Set to stdout for CLI streaming output. */
-extern FILE *vox_stream_output;
+#define VOX_MAX_ALT 4
+
+/* ========================================================================
+ * API Functions
+ * ======================================================================== */
 
 /* Load model from directory containing consolidated.safetensors + tekken.json */
 vox_ctx_t *vox_load(const char *model_dir);
@@ -236,9 +253,23 @@ int vox_stream_finish(vox_stream_t *s);
  * Returns number of tokens written (0 = nothing pending). */
 int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max);
 
-/* Set minimum processing interval in seconds. When set, feed() accumulates
- * audio but only runs the encoder/decoder after at least this many seconds
- * of new audio have been fed. 0 = process on every feed() (default).
+/* Configure alternative token tracking.
+ * n_alt: max alternatives per position (1-VOX_MAX_ALT, default 1 = no alts).
+ * cutoff: max distance from top token (0.0-1.0). A token qualifies if
+ *         1 - prob[i]/prob[0] <= cutoff. */
+void vox_stream_set_alt(vox_stream_t *s, int n_alt, float cutoff);
+
+/* Retrieve pending tokens with alternatives. out_tokens has max_tokens * n_alt
+ * slots. For each token position, n_alt consecutive entries: [0]=best, rest=
+ * alternatives or NULL. n_alt is clamped to VOX_MAX_ALT.
+ * Returns number of token positions dequeued. */
+int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
+                       int max_tokens, int n_alt);
+
+/* Set minimum time between encoder runs, in seconds.
+ * Lower = more responsive streaming (higher GPU overhead).
+ * Higher = more efficient batching (higher latency).
+ * Default: 2.0. First chunk always waits for ~3s (decoder prompt needs 312 mel).
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
 
@@ -262,9 +293,15 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx);
  * Internal Functions (used by encoder/decoder implementations)
  * ======================================================================== */
 
-/* Audio encoder forward pass */
+/* Audio encoder forward pass (full, non-incremental) */
 float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                            int mel_frames, int *out_seq_len);
+
+/* Incremental encoder forward pass (processes new_len post-conv-stem positions
+ * through transformer layers using encoder KV cache). Returns [new_len, 1280].
+ * Caller must free the returned buffer. */
+float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
+                                        int new_len, int *out_len);
 
 /* Adapter forward pass */
 float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
@@ -275,5 +312,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
 /* Decoder forward pass for prefill (multiple tokens) */
 void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len);
+int vox_decoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_seq);
+int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos);
 
 #endif /* VOXTRAL_H */

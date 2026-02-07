@@ -118,14 +118,27 @@ static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 8 * 128 = 1024 */
     size_t cache_size = (size_t)VOX_DEC_LAYERS * max_seq * kv_dim * sizeof(float);
 
-    ctx->kv_cache_k = (float *)calloc(1, cache_size);
-    ctx->kv_cache_v = (float *)calloc(1, cache_size);
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        ctx->kv_cache_k = (float *)vox_metal_shared_alloc(cache_size);
+        ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size);
+    } else
+#endif
+    {
+        ctx->kv_cache_k = (float *)calloc(1, cache_size);
+        ctx->kv_cache_v = (float *)calloc(1, cache_size);
+    }
     ctx->kv_cache_len = 0;
     ctx->kv_cache_max = max_seq;
     /* kv_pos_offset is NOT reset here — caller manages it */
 
     if (!ctx->kv_cache_k || !ctx->kv_cache_v) return -1;
     return 0;
+}
+
+int vox_decoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_seq) {
+    if (ctx->kv_cache_k) return 0; /* already allocated */
+    return kv_cache_init(ctx, max_seq);
 }
 
 /* Grow KV cache to fit at least `required` positions */
@@ -140,9 +153,26 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
     size_t old_stride = (size_t)ctx->kv_cache_max * kv_dim;
     size_t total = (size_t)VOX_DEC_LAYERS * new_stride * sizeof(float);
 
-    float *new_k = (float *)calloc(1, total);
-    float *new_v = (float *)calloc(1, total);
-    if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
+    float *new_k, *new_v;
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        new_k = (float *)vox_metal_shared_alloc(total);
+        new_v = (float *)vox_metal_shared_alloc(total);
+    } else
+#endif
+    {
+        new_k = (float *)calloc(1, total);
+        new_v = (float *)calloc(1, total);
+    }
+    if (!new_k || !new_v) {
+#ifdef USE_METAL
+        vox_metal_shared_free(new_k);
+        vox_metal_shared_free(new_v);
+#else
+        free(new_k); free(new_v);
+#endif
+        return -1;
+    }
 
     size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(float);
     for (int l = 0; l < VOX_DEC_LAYERS; l++) {
@@ -150,8 +180,13 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
     }
 
+#ifdef USE_METAL
+    vox_metal_shared_free(ctx->kv_cache_k);
+    vox_metal_shared_free(ctx->kv_cache_v);
+#else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+#endif
     ctx->kv_cache_k = new_k;
     ctx->kv_cache_v = new_v;
     ctx->kv_cache_max = new_max;
@@ -219,7 +254,38 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         if (kv_cache_grow(ctx, ctx->kv_cache_len + seq_len + 1024) != 0) return;
     }
 
-    /* Working buffers */
+    /* RoPE frequencies (logical positions include offset from compactions) */
+    int start_pos = ctx->kv_cache_len;
+    int logical_start = ctx->kv_pos_offset + start_pos;
+    int *positions = (int *)malloc(seq_len * sizeof(int));
+    if (!positions) return;
+    for (int i = 0; i < seq_len; i++) positions[i] = logical_start + i;
+    float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
+    if (!rope_freqs) { free(positions); return; }
+    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
+
+    /* GPU monolithic prefill: all 26 layers in one command buffer */
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        float *x = (float *)malloc(seq_len * dim * sizeof(float));
+        if (!x) { free(positions); free(rope_freqs); return; }
+        memcpy(x, input_embeds, seq_len * dim * sizeof(float));
+        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
+        free(x);
+        free(positions); free(rope_freqs);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    if (vox_cuda_decoder_prefill_full(ctx, input_embeds, seq_len, rope_freqs)) {
+        free(positions);
+        free(rope_freqs);
+        return;
+    }
+#endif
+
+    /* Working buffers (CPU fallback) */
     float *x = (float *)malloc(seq_len * dim * sizeof(float));
     memcpy(x, input_embeds, seq_len * dim * sizeof(float));
 
@@ -229,17 +295,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     float *v = (float *)malloc(seq_len * kv_dim * sizeof(float));
     float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
     float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
-    float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
-    float *up = (float *)malloc(seq_len * hidden * sizeof(float));
     float *ffn_out = (float *)malloc(seq_len * dim * sizeof(float));
-
-    /* RoPE frequencies (logical positions include offset from compactions) */
-    int start_pos = ctx->kv_cache_len;
-    int logical_start = ctx->kv_pos_offset + start_pos;
-    int *positions = (int *)malloc(seq_len * sizeof(int));
-    for (int i = 0; i < seq_len; i++) positions[i] = logical_start + i;
-    float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
-    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
@@ -248,9 +304,20 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         vox_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, VOX_DEC_NORM_EPS);
 
         /* Q, K, V projections (no bias in decoder, bf16 weights) */
-        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_fused_qkv_bf16(seq_len, dim, x_norm,
+                                      l->wq_weight_bf16, q_dim,
+                                      l->wk_weight_bf16, kv_dim,
+                                      l->wv_weight_bf16, kv_dim,
+                                      q, k, v);
+        } else
+#endif
+        {
+            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
+            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
+            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+        }
 
         /* Apply RoPE */
         vox_apply_rope(q, rope_freqs, seq_len, n_heads, head_dim);
@@ -287,19 +354,32 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
         /* Time conditioning (ada_rms_norm_t_cond): h_norm *= (1 + ada_scale[layer]) */
         if (ctx->ada_scale) {
-            const float *scale = ctx->ada_scale + (size_t)layer * dim;
+            const float *ada = ctx->ada_scale + (size_t)layer * dim;
             for (int s = 0; s < seq_len; s++) {
                 float *row = x_norm + (size_t)s * dim;
-                for (int i = 0; i < dim; i++) row[i] *= (1.0f + scale[i]);
+                for (int i = 0; i < dim; i++) row[i] *= (1.0f + ada[i]);
             }
         }
 
         /* SwiGLU */
-        vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
-        vox_silu(gate, seq_len * hidden);
-        vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
-        vox_mul_inplace(gate, up, seq_len * hidden);
-        vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
+                                      l->w1_weight_bf16, l->w3_weight_bf16,
+                                      l->w2_weight_bf16, ffn_out);
+        } else
+#endif
+        {
+            /* CPU path needs separate gate/up buffers */
+            float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
+            float *up = (float *)malloc(seq_len * hidden * sizeof(float));
+            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+            vox_silu(gate, seq_len * hidden);
+            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+            vox_mul_inplace(gate, up, seq_len * hidden);
+            vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+            free(gate); free(up);
+        }
 
         /* Residual */
         vox_add_inplace(x, ffn_out, seq_len * dim);
@@ -311,8 +391,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     ctx->kv_cache_len = start_pos + seq_len;
 
     free(x); free(x_norm); free(q); free(k); free(v);
-    free(attn_out); free(proj_out);
-    free(gate); free(up); free(ffn_out);
+    free(attn_out); free(proj_out); free(ffn_out);
     free(positions); free(rope_freqs);
 }
 
@@ -404,42 +483,42 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     int positions[1] = { logical_pos };
     vox_compute_rope_freqs(rope_freqs, positions, 1, head_dim, VOX_ROPE_THETA);
 
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        /* Try monolithic GPU path: all 26 layers + logits in ONE command buffer.
+         * RoPE, KV cache writes, and attention all run on GPU.
+         * Requires shared KV cache (allocated via vox_metal_shared_alloc). */
+        vox_metal_decoder_start(x, dim);
+        int token = vox_metal_decoder_full_step(ctx, rope_freqs, logits);
+        vox_metal_decoder_end();
+        if (token >= 0) return token;
+
+        /* full_step returned -1 (shared KV cache not available).
+         * Fall through to CPU path. */
+    }
+#endif
+
+    /* CPU fallback path */
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
 
         vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
+        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
+        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
+        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
 
-        /* Q, K, V projections (bf16 weights) */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_qkv_bf16(1, dim, x_norm,
-                                      l->wq_weight_bf16, q_dim,
-                                      l->wk_weight_bf16, kv_dim,
-                                      l->wv_weight_bf16, kv_dim,
-                                      q, k, v);
-        } else {
-#endif
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
-#ifdef USE_METAL
-        }
-#endif
-
-        /* Apply RoPE */
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
 
-        /* Store K, V in cache */
         memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
         memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
 
-        /* Attention over cached sequence */
         int total_seq = pos + 1;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
-        float scale = 1.0f / sqrtf((float)head_dim);
 #ifdef USE_CUDA
         if (!vox_cuda_attention_step(attn_out, q, k, v, layer, pos, total_seq, VOX_DEC_WINDOW))
 #endif
@@ -449,46 +528,28 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
                                  head_dim, scale, VOX_DEC_WINDOW, pos);
         }
 
-        /* Output projection + residual */
         vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
         vox_add_inplace(x, proj_out, dim);
 
-        /* FFN */
         vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
         if (ctx->ada_scale) {
             const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
             for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
         }
 
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_ffn_bf16(1, dim, hidden, x_norm,
-                                      l->w1_weight_bf16,
-                                      l->w3_weight_bf16,
-                                      l->w2_weight_bf16,
-                                      ffn_out);
-        } else {
-#endif
-            vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
-            vox_silu(gate_buf, hidden);
-            vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
-            vox_mul_inplace(gate_buf, up_buf, hidden);
-            vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
-#ifdef USE_METAL
-        }
-#endif
+        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+        vox_silu(gate_buf, hidden);
+        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+        vox_mul_inplace(gate_buf, up_buf, hidden);
+        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
         vox_add_inplace(x, ffn_out, dim);
     }
 
     ctx->kv_cache_len = pos + 1;
 
-    /* Final norm */
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
-
-    /* Compute logits: x @ tok_embeddings^T (tied weights, bf16) */
     vox_matmul_t_bf16(logits_buf, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 
-    /* Find argmax */
     int best = 0;
     float best_val = logits_buf[0];
     for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
@@ -497,6 +558,5 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             best = i;
         }
     }
-
     return best;
 }

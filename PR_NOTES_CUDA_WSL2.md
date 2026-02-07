@@ -4,6 +4,7 @@ This PR adds a production-oriented CUDA backend for Voxtral that works reliably 
 
 - Encoder + adapter (GPU resident, BF16 weights + cuBLAS GEMMs + CUDA elementwise kernels)
 - Decoder single-token generation (GPU resident, device KV cache + cuBLAS GEMMs + CUDA attention + GPU argmax)
+- Decoder prefill (prompt prefill, seq_len > 1): runs fully on GPU when possible
 
 The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for custom kernels to avoid PTX JIT issues under WSL2.
 
@@ -25,7 +26,10 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
 - Decoder full path:
   - Device-side KV cache (FP16 by default) and device-only intermediates.
   - Faster per-token attention kernel (online softmax, warp-synchronous).
+  - Optional attention v2 kernel variant (vectorized loads/stores; opt-in).
+  - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
+  - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
 ## Build
 
@@ -60,11 +64,13 @@ make cuda
 
 ## Benchmarks (WSL2 RTX 3080 Ti)
 
-All runs below are from the CLI and include end-to-end process time. Stage timings are printed with `VOX_PRINT_TIMINGS=1`:
+All runs below are from the CLI. Stage timings are printed with `VOX_PRINT_TIMINGS=1`:
 - `Model load:` is safetensors mmap + init.
 - `Encoder:` is the cumulative encoder+adapter time.
 - `Decoder:` is the cumulative decoder time.
-- `Wall transcribe:` is total transcription wall time.
+- `Wall transcribe:` is total transcription wall time (excluding `Model load:`).
+- `Total (load+transcribe):` is a derived sum printed by `scripts/benchmark_backends.sh` for comparisons that include model load in the end-to-end time.
+- `prefill` (in the `Decoder:` line) includes prompt prefill plus the first generated token step (the timing block wraps both).
 
 Audio durations:
 - `samples/test_speech.wav`: `3.641750s` (ffprobe)
@@ -73,16 +79,44 @@ Audio durations:
 ### `samples/test_speech.wav`
 
 BLAS (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
-- Model load: `60 ms`
-- Encoder: `760 mel -> 95 tokens (16128 ms)`
-- Decoder: `57 tokens in 28225 ms (495.2 ms/token)`
-- Wall transcribe: `44392 ms`
+- Model load: `75 ms`
+- Wall transcribe: `40918 ms`
+- Total (load+transcribe): `40993 ms`
+- Encoder: `760 mel -> 95 tokens (13864 ms)`
+- Decoder: `17 text tokens (57 steps) in 27046 ms (prefill 7772 ms + 344.2 ms/step)`
 
 CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
-- Model load: `30 ms`
-- Encoder: `760 mel -> 95 tokens (4192 ms)`
-- Decoder: `57 tokens in 2158 ms (37.9 ms/token)`
-- Wall transcribe: `6388 ms`
+- Model load: `31 ms`
+- Wall transcribe: `3045 ms`
+- Total (load+transcribe): `3076 ms`
+- Encoder: `760 mel -> 95 tokens (683 ms)`
+- Decoder: `17 text tokens (57 steps) in 2146 ms (prefill 1396 ms + 13.4 ms/step)`
+
+### CUDA Graphs (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_GRAPHS=1
+```
+
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; ~60s), CUDA Graphs reduced decoder launch overhead and improved throughput:
+
+- Without graphs: `Wall transcribe 17640 ms`, decoder `19.4 ms/step`
+- With graphs: `Wall transcribe 16785 ms`, decoder `18.2 ms/step`
+
+### Attention v2 (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_ATTN_V2=1
+```
+
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), the v2 attention kernel provides a small win:
+
+- Without graphs: decoder `19.2 -> 19.0 ms/step`, `Wall transcribe 17531 -> 17439 ms`
+- With graphs: decoder `18.2 -> 18.1 ms/step`, `Wall transcribe 16772 -> 16719 ms`
 
 ### `samples/I_have_a_dream.ogg` (180s)
 
@@ -93,19 +127,21 @@ ffmpeg -y -hide_banner -loglevel error -i samples/I_have_a_dream.ogg -ac 1 -ar 1
 ```
 
 BLAS:
-- Model load: `67 ms`
-- Encoder: `18400 mel -> 2300 tokens (396552 ms)` (6:36)
-- Decoder: `2262 tokens in 940197 ms (415.6 ms/token)` (15:40)
-- Wall transcribe: `1336966 ms` (22:17)
+- Model load: `68 ms`
+- Wall transcribe: `1468788 ms` (24:29)
+- Total (load+transcribe): `1468856 ms`
+- Encoder: `18400 mel -> 2300 tokens (541742 ms)` (9:02)
+- Decoder: `311 text tokens (2262 steps) in 926821 ms (prefill 7398 ms + 406.6 ms/step)` (15:27)
 
 CUDA:
-- Model load: `37 ms`
-- Encoder: `18400 mel -> 2300 tokens (79031 ms)`
-- Decoder: `2262 tokens in 78767 ms (34.8 ms/token)`
-- Wall transcribe: `158020 ms` (2:38)
+- Model load: `39 ms`
+- Wall transcribe: `81686 ms` (1:22)
+- Total (load+transcribe): `81725 ms`
+- Encoder: `18400 mel -> 2299 tokens (2588 ms)`
+- Decoder: `310 text tokens (2261 steps) in 78625 ms (prefill 1466 ms + 34.1 ms/step)` (1:19)
 
 BF16 cache stats at exit (same run):
-- `uploaded=8.23 GiB`, `misses=409`, `hits=414,849`
+- `uploaded=8.23 GiB`, `misses=409`, `hits=415,796`
 
 ## Profiling Notes
 
@@ -115,6 +151,10 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
 
 ## Debug / Escape Hatches
 
+- Enable CUDA Graphs for the decoder single-token step (opt-in):
+  - `VOX_CUDA_GRAPHS=1`
+- Disable CUDA Graphs (force non-graph path):
+  - `VOX_DISABLE_CUDA_GRAPHS=1`
 - Disable full CUDA encoder+adapter:
   - `VOX_DISABLE_CUDA_ENCODER_FULL=1`
 - Disable full CUDA decoder path:
@@ -125,3 +165,11 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_DISABLE_CUBLASLT=1`
 - Disable FP16 KV cache (use FP32 KV cache):
   - `VOX_CUDA_KV_FP16=0`
+- Disable CUDA decoder prefill fast path (force CPU prefill):
+  - `VOX_DISABLE_CUDA_PREFILL=1`
+- Disable RMSNorm->BF16 fused kernel (debug fallback):
+  - `VOX_DISABLE_CUDA_RMSNORM_BF16_FUSED=1`
+- Enable attention v2 kernel variant (opt-in):
+  - `VOX_CUDA_ATTN_V2=1`
+- Disable attention v2 kernel variant (force v1):
+  - `VOX_DISABLE_CUDA_ATTN_V2=1`

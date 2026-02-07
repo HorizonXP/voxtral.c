@@ -17,6 +17,10 @@ extern int vox_verbose_audio;
  * Returns NULL on error. Caller must free returned buffer. */
 float *vox_load_wav(const char *path, int *out_n_samples);
 
+/* Parse a WAV file from a memory buffer. Same behavior as vox_load_wav
+ * but operates on data already in memory. Caller must free returned buffer. */
+float *vox_parse_wav_buffer(const uint8_t *data, size_t size, int *out_n_samples);
+
 /* Read audio from stdin, returns mono float32 samples in [-1,1] at 16kHz.
  * Auto-detects format: WAV (RIFF header) or raw s16le 16kHz mono.
  * Returns NULL on error. Caller must free returned buffer. */
