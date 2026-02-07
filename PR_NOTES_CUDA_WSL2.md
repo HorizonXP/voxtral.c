@@ -92,6 +92,12 @@ Convert once:
 ffmpeg -y -hide_banner -loglevel error -i samples/I_have_a_dream.ogg -ac 1 -ar 16000 /tmp/I_have_a_dream.wav
 ```
 
+BLAS:
+- Model load: `67 ms`
+- Encoder: `18400 mel -> 2300 tokens (396552 ms)` (6:36)
+- Decoder: `2262 tokens in 940197 ms (415.6 ms/token)` (15:40)
+- Wall transcribe: `1336966 ms` (22:17)
+
 CUDA:
 - Model load: `37 ms`
 - Encoder: `18400 mel -> 2300 tokens (79031 ms)`
@@ -119,4 +125,3 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_DISABLE_CUBLASLT=1`
 - Disable FP16 KV cache (use FP32 KV cache):
   - `VOX_CUDA_KV_FP16=0`
-
