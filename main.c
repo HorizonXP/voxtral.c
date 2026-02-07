@@ -289,12 +289,6 @@ int main(int argc, char **argv) {
         feed_and_drain(s, samples, n_samples);
         free(samples);
     }
-    gettimeofday(&t1_run, NULL);
-    if (force_timing) {
-        double run_ms = (t1_run.tv_sec - t0_run.tv_sec) * 1000.0 +
-                        (t1_run.tv_usec - t0_run.tv_usec) / 1000.0;
-        fprintf(stderr, "Wall transcribe: %.0f ms\n", run_ms);
-    }
 
     vox_stream_finish(s);
     drain_tokens(s);

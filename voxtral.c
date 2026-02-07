@@ -773,9 +773,9 @@ static void stream_run_encoder(vox_stream_t *s) {
                 if (new_enc_len > 0 && !adapter_chunk) break;
             }
 
-            int overlap_enc = actual_overlap_mel / 2;
-            int new_enc_len = enc_len - overlap_enc;
-            new_enc_len = (new_enc_len / 4) * 4;
+            gettimeofday(&t1, NULL);
+            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
 
             if (chunk_tokens > 0 && adapter_chunk) {
                 if (s->total_adapter + chunk_tokens > s->adapter_cap) {
