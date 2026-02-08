@@ -107,10 +107,10 @@ Enable with:
 VOX_CUDA_GRAPHS=1
 ```
 
-On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; ~60s), CUDA Graphs reduced decoder launch overhead and improved throughput:
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; ~60s), CUDA Graphs reduce CPU launch overhead. On this setup they also auto-select attention v3 for graph capture when available (unless disabled):
 
-- Without graphs: `Wall transcribe 17640 ms`, decoder `19.4 ms/step`
-- With graphs: `Wall transcribe 16785 ms`, decoder `18.2 ms/step`
+- Without graphs: `Wall transcribe 16916 ms`, decoder `18.7 ms/step`
+- With graphs: `Wall transcribe 12696 ms`, decoder `13.2 ms/step`
 
 ### Attention v2 (opt-in)
 
@@ -120,10 +120,10 @@ Enable with:
 VOX_CUDA_ATTN_V2=1
 ```
 
-On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), the v2 attention kernel provides a small win:
+Attention v2 is experimental and can regress depending on GPU/driver/toolkit. On this setup (RTX 3080 Ti + WSL2) it was significantly slower, so keep it disabled unless you benchmark it on your hardware:
 
-- Without graphs: decoder `19.2 -> 19.0 ms/step`, `Wall transcribe 17531 -> 17439 ms`
-- With graphs: decoder `18.2 -> 18.1 ms/step`, `Wall transcribe 16772 -> 16719 ms`
+- Without graphs: `Wall transcribe 107635 ms`, decoder `74.8 ms/step`
+- With graphs: `Wall transcribe 102259 ms`, decoder `58.2 ms/step`
 
 ### Attention v3 (opt-in)
 
@@ -138,10 +138,12 @@ Notes:
 - v3 uses a 2-stage chunked reduction and reduces redundant KV loads under GQA by having one block compute 4 query heads that share the same KV head.
 - When CUDA Graphs are enabled (`VOX_CUDA_GRAPHS=1`), v3 is auto-selected for the graph capture path if available (unless disabled via `VOX_DISABLE_CUDA_ATTN_V3=1`).
 
-On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a clear win (numbers from `./runtest.sh`):
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a win for the non-graph decoder path (numbers from `VOX_PRINT_TIMINGS=1`):
 
-- Without graphs: decoder `19.6 -> 14.8 ms/step` (`16254 -> 12594 ms` total decoder time)
-- With graphs: decoder `18.6 -> 13.7 ms/step` (`15537 -> 11776 ms` total decoder time)
+- Without v3: `Wall transcribe 16916 ms`, decoder `18.7 ms/step`
+- With v3: `Wall transcribe 14364 ms`, decoder `15.4 ms/step`
+
+When CUDA Graphs are enabled, v3 is auto-selected for the graph capture path if available (unless disabled via `VOX_DISABLE_CUDA_ATTN_V3=1`).
 
 ### Merged Decoder Projections (opt-in)
 
@@ -159,10 +161,10 @@ Notes:
   - `VOX_CUDA_MERGE_QKV=1`
   - `VOX_CUDA_MERGE_FFN13=1`
 
-On `samples/antirez_speaking_italian_short.ogg` (~60s), combined with CUDA Graphs and v3 attention, merged projections reduced per-step decoder time further (numbers from `./runtest.sh`):
+On `samples/antirez_speaking_italian_short.ogg` (~60s), combined with CUDA Graphs, merged projections reduced per-step decoder time further (numbers from `VOX_PRINT_TIMINGS=1`):
 
-- Graphs+v3 (no merged weights): decoder ~`13.7 ms/step`
-- Graphs+v3+merged weights: decoder ~`12.8 ms/step`
+- Graphs (no merged weights): decoder ~`13.2 ms/step`
+- Graphs + merged weights: decoder ~`12.7 ms/step`
 
 ### Device RoPE For CUDA Graphs (opt-in)
 
@@ -174,6 +176,7 @@ VOX_CUDA_ROPE_DEV=1
 
 When enabled (and if the optional kernel is available), CUDA Graph mode generates the RoPE freqs on-device inside the captured graph:
 - Upload `logical_pos` (4 bytes) instead of computing trig on CPU and uploading the RoPE freqs (~512 bytes) per step.
+Note: this is primarily about reducing host-side work; end-to-end speed impact can be neutral depending on GPU/driver.
 
 ### GPU Conv Stem (opt-in)
 
