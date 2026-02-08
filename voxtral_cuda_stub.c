@@ -129,7 +129,11 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
     return 0;
 }
 
+int vox_cuda_prefetch_weights(vox_ctx_t *ctx) {
+    (void)ctx;
+    return 0;
+}
+
 void vox_cuda_shutdown(void) {}
 
 #endif /* !USE_CUDA */
-

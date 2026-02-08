@@ -244,6 +244,19 @@ vox_ctx_t *vox_load(const char *model_dir) {
     }
 #endif
 
+#ifdef USE_CUDA
+    /* Optional: prefetch CUDA weight caches at load time to avoid paying for
+     * weight uploads in the first transcription call. */
+    if (vox_cuda_available()) {
+        const char *env = getenv("VOX_CUDA_PREFETCH");
+        if (env && env[0] && env[0] != '0') {
+            if (vox_verbose >= 2)
+                fprintf(stderr, "Pre-warming CUDA weight cache...\n");
+            (void)vox_cuda_prefetch_weights(ctx);
+        }
+    }
+#endif
+
     if (vox_verbose >= 1)
         fprintf(stderr, "Model loaded.\n");
     return ctx;

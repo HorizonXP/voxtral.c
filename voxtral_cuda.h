@@ -126,6 +126,11 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
                                   int seq_len,
                                   const float *rope_freqs);
 
+/* Optional: prefetch model weights into the CUDA caches at load time.
+ * This shifts first-token cost out of the first transcription call.
+ * Opt-in via VOX_CUDA_PREFETCH=1. */
+int vox_cuda_prefetch_weights(vox_ctx_t *ctx);
+
 const char *vox_cuda_device_name(void);
 void vox_cuda_shutdown(void);
 
