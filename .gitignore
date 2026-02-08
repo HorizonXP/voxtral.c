@@ -8,3 +8,9 @@ voxtral-model/
 pyenv*/
 misc/
 *.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+.vs/
+build_log*.txt

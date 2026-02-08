@@ -37,31 +37,51 @@
  * ======================================================================== */
 
 void vox_add_inplace(float *a, const float *b, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<18))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) a[i] += b[i];
+    for (i = 0; i < n; i++) a[i] += b[i];
 }
 
 void vox_mul_inplace(float *a, const float *b, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<18))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) a[i] *= b[i];
+    for (i = 0; i < n; i++) a[i] *= b[i];
 }
 
 void vox_axpy(float *a, float scale, const float *b, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<18))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) a[i] += scale * b[i];
+    for (i = 0; i < n; i++) a[i] += scale * b[i];
 }
 
 void vox_scale(float *x, float s, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<18))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) x[i] *= s;
+    for (i = 0; i < n; i++) x[i] *= s;
 }
 
 void vox_copy(float *dst, const float *src, int n) {
@@ -399,10 +419,15 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
 
 void vox_rms_norm(float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
+    int s;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if ((long long)seq_len * hidden >= (1LL<<20))
+    #endif
 #endif
-    for (int s = 0; s < seq_len; s++) {
+    for (s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
 
@@ -424,20 +449,30 @@ void vox_rms_norm(float *out, const float *x, const float *weight,
  * ======================================================================== */
 
 void vox_silu(float *x, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<19))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {
         float val = x[i];
         x[i] = val / (1.0f + expf(-val));
     }
 }
 
 void vox_gelu(float *x, int n) {
+    int i;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n >= (1<<19))
+    #endif
 #endif
-    for (int i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {
         float val = x[i];
         /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
         float x3 = val * val * val;
@@ -491,10 +526,15 @@ void vox_causal_attention(float *out, const float *Q, const float *K, const floa
     int kv_hidden = n_kv_heads * head_dim;
 
     /* Process each query head */
+    int h;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if (n_heads >= 8)
+    #endif
 #endif
-    for (int h = 0; h < n_heads; h++) {
+    for (h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;  /* GQA: map query head to KV head */
 
         for (int i = 0; i < seq_q; i++) {
@@ -583,10 +623,15 @@ void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_d
     int half_dim = head_dim / 2;
     int hidden = heads * head_dim;
 
+    int s;
 #ifdef _OPENMP
+    #if defined(_MSC_VER)
+    #pragma omp parallel for schedule(static)
+    #else
     #pragma omp parallel for schedule(static) if ((long long)seq * heads >= 256)
+    #endif
 #endif
-    for (int s = 0; s < seq; s++) {
+    for (s = 0; s < seq; s++) {
         for (int h = 0; h < heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 

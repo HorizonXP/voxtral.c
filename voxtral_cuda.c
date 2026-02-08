@@ -11,7 +11,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <limits.h>
 
 #include "voxtral_cuda_kernels_cubin.h"
@@ -256,9 +263,16 @@ static int mempool_wanted(void) {
 static size_t host_page_size(void) {
     static size_t cached = 0;
     if (cached) return cached;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cached = (size_t)si.dwPageSize;
+    if (!cached) cached = 4096;
+#else
     long p = sysconf(_SC_PAGESIZE);
     if (p <= 0) p = 4096;
     cached = (size_t)p;
+#endif
     return cached;
 }
 
@@ -4765,7 +4779,10 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
     if (r != CUDA_SUCCESS) { log_cu_error("sync(dec_prefill)", r); return 0; }
 
     ctx->kv_cache_len = start_pos + seq_len;
-    ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
+    /* Prefill writes KV on the device-side cache. The host KV cache is only
+     * kept in sync on-demand (when falling back to CPU attention). */
+    if (ctx->kv_cache_host_valid_len < 0) ctx->kv_cache_host_valid_len = 0;
+    if (ctx->kv_cache_host_valid_len > start_pos) ctx->kv_cache_host_valid_len = start_pos;
     return 1;
 }
 

@@ -88,7 +88,10 @@ run_case() {
 }
 
 ran_blas=0
-if make blas >/dev/null 2>&1; then
+if [[ "${VOX_BENCH_SKIP_BLAS:-0}" == "1" ]]; then
+  echo "[info] VOX_BENCH_SKIP_BLAS=1: skipping BLAS benchmark"
+  echo
+elif make blas >/dev/null 2>&1; then
   run_case blas blas
   ran_blas=1
 else

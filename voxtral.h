@@ -11,6 +11,26 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Windows/POSIX Portability */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#define strdup _strdup
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+/* Cross-platform time in milliseconds (monotonic-ish). */
+double vox_get_time_ms(void);
+
 /* ========================================================================
  * Model Constants
  * ======================================================================== */

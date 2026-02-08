@@ -290,7 +290,8 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
 #ifdef USE_CUDA
     if (vox_cuda_decoder_prefill_full(ctx, input_embeds, seq_len, rope_freqs)) {
-        ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
+        /* CUDA prefill keeps KV on-device; host KV cache stays stale until
+         * we need to fall back to CPU attention (lazy download). */
         free(positions);
         free(rope_freqs);
         return;
