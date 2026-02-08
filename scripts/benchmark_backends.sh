@@ -100,6 +100,7 @@ run_case cuda cuda
 
 if [[ "${VOX_BENCH_CUDA_OPTS:-0}" == "1" ]]; then
   echo "== extra CUDA variants (VOX_BENCH_CUDA_OPTS=1) =="
+  run_case cuda "cuda+fast" VOX_CUDA_FAST=1
   run_case cuda "cuda+graphs" VOX_CUDA_GRAPHS=1
   run_case cuda "cuda+attn_v3" VOX_CUDA_ATTN_V3=1
   run_case cuda "cuda+graphs+attn_v3" VOX_CUDA_GRAPHS=1 VOX_CUDA_ATTN_V3=1

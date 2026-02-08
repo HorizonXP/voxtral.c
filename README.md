@@ -402,6 +402,18 @@ If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will o
 ./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
 ```
 
+Fast CUDA config (best-effort, can be overridden by per-feature env vars):
+
+```bash
+VOX_CUDA_FAST=1 ./voxtral -d voxtral-model -i samples/test_speech.wav
+```
+
+To run the extra CUDA benchmark variants (graphs/v3/merged/etc):
+
+```bash
+VOX_BENCH_CUDA_OPTS=1 ./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+```
+
 
 ### Driver / Toolkit matrix (known-good starting point)
 

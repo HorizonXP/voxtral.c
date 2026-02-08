@@ -20,6 +20,10 @@ fi
 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_smoke.txt
 printf "[ok] CUDA smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_smoke.txt)"
 
+# "All opts on" convenience knob (best-effort; respects per-feature disables).
+VOX_CUDA_FAST=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_smoke.txt
+printf "[ok] CUDA fast smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_smoke.txt)"
+
 # CUDA Graph smoke (opt-in). Also validates the graph capture path.
 VOX_CUDA_GRAPHS=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_graph_smoke.txt
 printf "[ok] CUDA graphs smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_graph_smoke.txt)"
