@@ -4316,8 +4316,6 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) return 0;
     }
 
-    ctx->kv_cache_len = pos + 1;
-
     /* Final norm */
     CUdeviceptr d_norm = f32_cache_get(dec->norm, (size_t)dim * sizeof(float));
     if (!d_norm) return 0;
@@ -4347,6 +4345,7 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     r = cuStreamSynchronize(g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("sync(decoder_full)", r); return 0; }
 
+    ctx->kv_cache_len = total_seq;
     *out_token = best;
     return 1;
 }
