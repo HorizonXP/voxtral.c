@@ -1546,6 +1546,16 @@ extern "C" __global__ void vox_silu_inplace_f32(float *x, int n) {
     x[idx] = v / (1.0f + __expf(-v));
 }
 
+extern "C" __global__ void vox_silu_mul_inplace_f32(float *x,
+                                                    const float *y,
+                                                    int n) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) return;
+    float v = x[idx];
+    float s = v / (1.0f + __expf(-v));
+    x[idx] = s * y[idx];
+}
+
 extern "C" __global__ void vox_gelu_inplace_f32(float *x, int n) {
     int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) return;
