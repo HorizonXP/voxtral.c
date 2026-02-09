@@ -2635,8 +2635,8 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
     int base = (int)blockIdx.x * ROWS_PER_BLOCK;
     if (base >= vocab) return;
 
-    /* Dynamic shared: x_bf16[dim]. */
-    extern __shared__ uint16_t shx[];
+    /* Dynamic shared: x_bf16[dim]. Align to enable vectorized loads. */
+    extern __shared__ __align__(16) uint16_t shx[];
     for (int i = tid; i < dim; i += (int)blockDim.x) {
         shx[i] = x_bf16[i];
     }
@@ -2645,18 +2645,64 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
     float warp_best = -1.0e30f;
     int warp_best_idx = 0;
 
-    /* Assign rows interleaved by warp for coalescing. */
+    /* Assign rows interleaved by warp for coalescing. Vectorize the inner loop by
+     * loading 2 BF16 values at a time (uint32), halving loop iterations. */
+    const uint4 *x4 = (const uint4 *)shx;
+    int vec4 = dim >> 3; /* BF16 groups of 8 */
+    int can_vec4 = ((dim & 7) == 0);
+
     for (int r = 0; r < ROWS_PER_WARP; r++) {
         int row = base + warp + r * WARPS;
         if (row >= vocab) continue;
         const uint16_t *w = tok_bf16 + (size_t)row * (size_t)dim;
 
         float sum = 0.0f;
-        for (int k = lane; k < dim; k += 32) {
-            float a = vox_bf16_to_f32(shx[k]);
-            float b = vox_bf16_to_f32(w[k]);
-            sum += a * b;
+        if (can_vec4) {
+            const uint4 *w4 = (const uint4 *)w;
+            for (int i = lane; i < vec4; i += 32) {
+                uint4 ax = x4[i];
+                uint4 bx = w4[i];
+
+                /* Each u32 packs 2 BF16 values. */
+                uint32_t ax0 = ax.x, ax1 = ax.y, ax2 = ax.z, ax3 = ax.w;
+                uint32_t bx0 = bx.x, bx1 = bx.y, bx2 = bx.z, bx3 = bx.w;
+
+                float a0 = vox_bf16_to_f32((uint16_t)(ax0 & 0xffffu));
+                float a1 = vox_bf16_to_f32((uint16_t)(ax0 >> 16));
+                float b0 = vox_bf16_to_f32((uint16_t)(bx0 & 0xffffu));
+                float b1 = vox_bf16_to_f32((uint16_t)(bx0 >> 16));
+                sum = fmaf(a0, b0, sum);
+                sum = fmaf(a1, b1, sum);
+
+                a0 = vox_bf16_to_f32((uint16_t)(ax1 & 0xffffu));
+                a1 = vox_bf16_to_f32((uint16_t)(ax1 >> 16));
+                b0 = vox_bf16_to_f32((uint16_t)(bx1 & 0xffffu));
+                b1 = vox_bf16_to_f32((uint16_t)(bx1 >> 16));
+                sum = fmaf(a0, b0, sum);
+                sum = fmaf(a1, b1, sum);
+
+                a0 = vox_bf16_to_f32((uint16_t)(ax2 & 0xffffu));
+                a1 = vox_bf16_to_f32((uint16_t)(ax2 >> 16));
+                b0 = vox_bf16_to_f32((uint16_t)(bx2 & 0xffffu));
+                b1 = vox_bf16_to_f32((uint16_t)(bx2 >> 16));
+                sum = fmaf(a0, b0, sum);
+                sum = fmaf(a1, b1, sum);
+
+                a0 = vox_bf16_to_f32((uint16_t)(ax3 & 0xffffu));
+                a1 = vox_bf16_to_f32((uint16_t)(ax3 >> 16));
+                b0 = vox_bf16_to_f32((uint16_t)(bx3 & 0xffffu));
+                b1 = vox_bf16_to_f32((uint16_t)(bx3 >> 16));
+                sum = fmaf(a0, b0, sum);
+                sum = fmaf(a1, b1, sum);
+            }
+        } else {
+            for (int k = lane; k < dim; k += 32) {
+                float a = vox_bf16_to_f32(shx[k]);
+                float b = vox_bf16_to_f32(w[k]);
+                sum = fmaf(a, b, sum);
+            }
         }
+
         sum = warp_reduce_sum(sum);
         if (lane == 0) {
             if (sum > warp_best || (sum == warp_best && row < warp_best_idx)) {
