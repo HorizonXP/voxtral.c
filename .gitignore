@@ -14,3 +14,5 @@ misc/
 *.ilk
 .vs/
 build_log*.txt
+.venv/
+__pycache__/

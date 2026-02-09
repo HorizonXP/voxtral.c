@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voxtral Realtime Dictation (Local)</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header>
+        <h1>Voxtral Realtime Dictation</h1>
+        <p class="sub">
+          WebSocket realtime demo: mic audio (16kHz PCM) &rarr; server &rarr; streaming text deltas.
+        </p>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <label>
+            Server
+            <input id="serverUrl" type="text" value="" />
+          </label>
+          <label>
+            Interval (-I)
+            <input id="interval" type="number" step="0.1" min="0.1" value="0.5" />
+          </label>
+        </div>
+
+        <div class="row">
+          <button id="btnStart">Start</button>
+          <button id="btnStop" disabled>Stop</button>
+          <span id="status" class="status">Idle</span>
+        </div>
+
+        <details class="details">
+          <summary>Notes</summary>
+          <ul>
+            <li>This is an MVP demo and assumes the server is running locally.</li>
+            <li>Audio is captured in the browser and downsampled to 16kHz mono PCM16.</li>
+            <li>Press Stop to send a final flush and close the session.</li>
+          </ul>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>Transcript</h2>
+        <pre id="transcript" class="transcript" spellcheck="false"></pre>
+        <div class="row">
+          <button id="btnCopy">Copy</button>
+          <button id="btnClear">Clear</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/client.js"></script>
+  </body>
+</html>
+
