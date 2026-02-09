@@ -5144,16 +5144,6 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
             return 0;
         }
 
-        /* Keep host KV cache in sync (for CPU fallback and for compactions). */
-        size_t host_stride = (size_t)ctx->kv_cache_max * (size_t)kv_dim;
-        float *hk = ctx->kv_cache_k + (size_t)layer * host_stride + (size_t)start_pos * (size_t)kv_dim;
-        float *hv = ctx->kv_cache_v + (size_t)layer * host_stride + (size_t)start_pos * (size_t)kv_dim;
-        size_t hv_bytes = (size_t)seq_len * (size_t)kv_dim * sizeof(float);
-        r = cuMemcpyDtoHAsync(hk, g_dec_k, hv_bytes, g_stream);
-        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(dec_prefill_k)", r); return 0; }
-        r = cuMemcpyDtoHAsync(hv, g_dec_v, hv_bytes, g_stream);
-        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(dec_prefill_v)", r); return 0; }
-
         /* Causal attention over the full cached sequence (here: start_pos=0) */
         int total_seq = start_pos + seq_len;
         if (!vox_cuda_causal_attention_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
