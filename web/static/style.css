@@ -1,0 +1,121 @@
+:root {
+  --bg: #0e0f13;
+  --fg: #e9edf1;
+  --muted: #aab3bd;
+  --card: #161824;
+  --border: #2a2e3a;
+  --accent: #c7ff3a;
+  --danger: #ff4d4d;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: radial-gradient(1200px 600px at 20% 0%, #1a1d2a 0%, var(--bg) 60%);
+  color: var(--fg);
+  font: 16px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+.wrap {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 28px 18px 48px;
+}
+
+header h1 {
+  margin: 0 0 8px 0;
+  letter-spacing: -0.02em;
+  font-size: 28px;
+}
+
+.sub {
+  margin: 0 0 18px 0;
+  color: var(--muted);
+}
+
+.card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 14px 0;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.35);
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input {
+  min-width: 260px;
+  padding: 10px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.25);
+  color: var(--fg);
+  outline: none;
+}
+
+input:focus {
+  border-color: rgba(199,255,58,0.7);
+  box-shadow: 0 0 0 3px rgba(199,255,58,0.12);
+}
+
+button {
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.25);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+button:hover { border-color: rgba(199,255,58,0.5); }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+#btnStart { border-color: rgba(199,255,58,0.35); }
+#btnStop { border-color: rgba(255,77,77,0.4); }
+
+.status {
+  margin-left: 8px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+}
+
+.details {
+  margin-top: 10px;
+  color: var(--muted);
+}
+
+.details ul {
+  margin: 10px 0 0 18px;
+}
+
+.transcript {
+  min-height: 160px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.35);
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 14px;
+}
+
