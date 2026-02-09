@@ -102,6 +102,9 @@ static CUfunction g_fn_rope_freqs_1pos = 0;
 static CUfunction g_fn_step_embed_from_adapter = 0;
 static CUfunction g_fn_downsample4 = 0;
 static CUfunction g_fn_argmax = 0;
+static CUfunction g_fn_logits_best_init_u64 = 0;
+static CUfunction g_fn_logits_best_bf16_top1 = 0;
+static CUfunction g_fn_logits_best_unpack_u64 = 0;
 
 static CUdeviceptr g_dA = 0;
 static CUdeviceptr g_dB = 0;
@@ -238,6 +241,18 @@ static int attn_v4_enabled(void) {
         return cached;
     }
     cached = cuda_fast_enabled();
+    return cached;
+}
+
+static int logits_fused_enabled(void) {
+    /* Opt-in: fused top1-only logits projection (avoids materializing logits[]).
+     * Default off until validated broadly. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *disable = getenv("VOX_DISABLE_CUDA_LOGITS_FUSED");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_LOGITS_FUSED");
+    cached = (env && env[0] && env[0] != '0');
     return cached;
 }
 
@@ -593,6 +608,8 @@ static CUdeviceptr g_dec_ffn = 0;
 static CUdeviceptr g_dec_rope_freqs = 0;
 static CUdeviceptr g_dec_logits = 0;
 static CUdeviceptr g_dec_best = 0;
+/* Optional: packed (logit,idx) state for fused top1-only logits path. */
+static CUdeviceptr g_dec_best_packed = 0;
 
 static size_t g_cap_dec_x = 0;
 static size_t g_cap_dec_x_norm = 0;
@@ -612,6 +629,7 @@ static size_t g_cap_dec_ffn = 0;
 static size_t g_cap_dec_rope = 0;
 static size_t g_cap_dec_logits = 0;
 static size_t g_cap_dec_best = 0;
+static size_t g_cap_dec_best_packed = 0;
 
 static const float **g_batched_A = NULL;
 static const float **g_batched_B = NULL;
@@ -631,6 +649,7 @@ static int g_dec_graph_use_host_x = 0;
 static int g_dec_graph_use_host_pos = 0;
 static int g_dec_graph_use_host_logical_pos = 0;
 static int g_dec_graph_use_best_dtoh = 0;
+static int g_dec_graph_use_logits_fused = 0;
 
 static int ensure_buffer(CUdeviceptr *buf, size_t *cap, size_t needed_bytes) {
     if (*cap >= needed_bytes) return 1;
@@ -1166,6 +1185,15 @@ static int cuda_load_kernel_module(void) {
             if (!g_fn_step_embed_from_adapter)
                 (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter, g_mod, "vox_step_embed_from_adapter_f32");
         }
+        /* Optional fused logits (top1-only) kernels (best-effort). */
+        if (g_mod) {
+            if (!g_fn_logits_best_init_u64)
+                (void)cuModuleGetFunction(&g_fn_logits_best_init_u64, g_mod, "vox_logits_best_init_u64");
+            if (!g_fn_logits_best_bf16_top1)
+                (void)cuModuleGetFunction(&g_fn_logits_best_bf16_top1, g_mod, "vox_logits_best_bf16_top1");
+            if (!g_fn_logits_best_unpack_u64)
+                (void)cuModuleGetFunction(&g_fn_logits_best_unpack_u64, g_mod, "vox_logits_best_unpack_u64");
+        }
         return 1;
     }
     if (!vox_cuda_available()) return 0;
@@ -1231,6 +1259,9 @@ static int cuda_load_kernel_module(void) {
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_downsample4_concat_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_argmax, g_mod, "vox_argmax_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_argmax_f32)", r); return 0; }
+    (void)cuModuleGetFunction(&g_fn_logits_best_init_u64, g_mod, "vox_logits_best_init_u64");
+    (void)cuModuleGetFunction(&g_fn_logits_best_bf16_top1, g_mod, "vox_logits_best_bf16_top1");
+    (void)cuModuleGetFunction(&g_fn_logits_best_unpack_u64, g_mod, "vox_logits_best_unpack_u64");
 
     /* Optional legacy kernel (kept for now; not used in the fast path). */
     (void)cuModuleGetFunction(&g_fn_causal_attn, g_mod, "vox_causal_attn_f32");
@@ -1752,6 +1783,63 @@ static int launch_argmax(CUdeviceptr out_idx,
                                 0, g_stream,
                                 params, NULL);
     if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(argmax)", r); return 0; }
+    return 1;
+}
+
+static int launch_logits_best_init_u64(CUdeviceptr best_packed) {
+    if (!best_packed) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_logits_best_init_u64) return 0;
+
+    void *params[] = { &best_packed };
+    CUresult r = cuLaunchKernel(g_fn_logits_best_init_u64,
+                                1, 1, 1,
+                                1, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(logits_best_init)", r); return 0; }
+    return 1;
+}
+
+static int launch_logits_best_bf16_top1(CUdeviceptr best_packed,
+                                        CUdeviceptr x_bf16,
+                                        CUdeviceptr tok_bf16,
+                                        int dim,
+                                        int vocab) {
+    if (!best_packed || !x_bf16 || !tok_bf16) return 0;
+    if (dim <= 0 || vocab <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_logits_best_bf16_top1) return 0;
+
+    /* Keep in sync with ROWS_PER_BLOCK in voxtral_cuda_kernels.cu. */
+    int rows_per_block = 32;
+    int threads = 256;
+    int blocks = (vocab + rows_per_block - 1) / rows_per_block;
+    size_t shmem = (size_t)dim * sizeof(uint16_t);
+
+    void *params[] = { &best_packed, &x_bf16, &tok_bf16, &dim, &vocab };
+    CUresult r = cuLaunchKernel(g_fn_logits_best_bf16_top1,
+                                blocks, 1, 1,
+                                threads, 1, 1,
+                                (unsigned int)shmem, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(logits_best_bf16_top1)", r); return 0; }
+    return 1;
+}
+
+static int launch_logits_best_unpack_u64(CUdeviceptr out_idx,
+                                         CUdeviceptr best_packed) {
+    if (!out_idx || !best_packed) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_logits_best_unpack_u64) return 0;
+
+    void *params[] = { &out_idx, &best_packed };
+    CUresult r = cuLaunchKernel(g_fn_logits_best_unpack_u64,
+                                1, 1, 1,
+                                1, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(logits_best_unpack)", r); return 0; }
     return 1;
 }
 
@@ -2439,6 +2527,7 @@ void vox_cuda_shutdown(void) {
     g_dec_graph_use_host_pos = 0;
     g_dec_graph_use_host_logical_pos = 0;
     g_dec_graph_use_best_dtoh = 0;
+    g_dec_graph_use_logits_fused = 0;
     shutdown_dev_free_ptr(&g_dec_pos_dev);
     shutdown_dev_free_ptr(&g_dec_logical_pos_dev);
     shutdown_dev_free_ptr(&g_dec_rope_inv_freq);
@@ -2590,12 +2679,13 @@ void vox_cuda_shutdown(void) {
     shutdown_dev_free_ptr(&g_dec_rope_freqs);
     shutdown_dev_free_ptr(&g_dec_logits);
     shutdown_dev_free_ptr(&g_dec_best);
+    shutdown_dev_free_ptr(&g_dec_best_packed);
     g_dec_x = g_dec_x_norm = g_dec_x_bf16 = 0;
     g_dec_q = g_dec_k = g_dec_v = g_dec_qkv = 0;
     g_dec_attn = g_dec_attn_bf16 = 0;
     g_dec_proj = g_dec_gate = g_dec_up = g_dec_ffn13 = 0;
     g_dec_gate_bf16 = g_dec_ffn = 0;
-    g_dec_rope_freqs = g_dec_logits = g_dec_best = 0;
+    g_dec_rope_freqs = g_dec_logits = g_dec_best = g_dec_best_packed = 0;
     g_cap_dec_x = g_cap_dec_x_norm = g_cap_dec_x_bf16 = 0;
     g_cap_dec_q = g_cap_dec_k = g_cap_dec_v = g_cap_dec_qkv = 0;
     g_cap_dec_attn = g_cap_dec_attn_bf16 = 0;
@@ -2604,6 +2694,7 @@ void vox_cuda_shutdown(void) {
     g_cap_dec_rope = 0;
     g_cap_dec_logits = 0;
     g_cap_dec_best = 0;
+    g_cap_dec_best_packed = 0;
 
     shutdown_dev_free_ptr(&g_k_cache);
     shutdown_dev_free_ptr(&g_v_cache);
@@ -2663,6 +2754,9 @@ void vox_cuda_shutdown(void) {
     g_fn_step_embed_from_adapter = 0;
     g_fn_downsample4 = 0;
     g_fn_argmax = 0;
+    g_fn_logits_best_init_u64 = 0;
+    g_fn_logits_best_bf16_top1 = 0;
+    g_fn_logits_best_unpack_u64 = 0;
 
     free((void *)g_batched_A);
     free((void *)g_batched_B);
@@ -3916,6 +4010,7 @@ static void decoder_graph_destroy(void) {
     g_dec_graph_use_host_pos = 0;
     g_dec_graph_use_host_logical_pos = 0;
     g_dec_graph_use_best_dtoh = 0;
+    g_dec_graph_use_logits_fused = 0;
 
     if (g_dec_pos_dev) cuMemFree(g_dec_pos_dev);
     g_dec_pos_dev = 0;
@@ -3979,7 +4074,8 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
         !ensure_buffer(&g_dec_ffn, &g_cap_dec_ffn, (size_t)dim * sizeof(float)) ||
         !ensure_buffer(&g_dec_rope_freqs, &g_cap_dec_rope, bytes_rope) ||
         !ensure_buffer(&g_dec_logits, &g_cap_dec_logits, (size_t)VOX_VOCAB_SIZE * sizeof(float)) ||
-        !ensure_buffer(&g_dec_best, &g_cap_dec_best, sizeof(int))) {
+        !ensure_buffer(&g_dec_best, &g_cap_dec_best, sizeof(int)) ||
+        !ensure_buffer(&g_dec_best_packed, &g_cap_dec_best_packed, sizeof(unsigned long long))) {
         return 0;
     }
 
@@ -4097,7 +4193,7 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
     return 1;
 }
 
-static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device) {
+static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int use_logits_fused) {
     if (!ctx) return 0;
     if (!vox_cuda_available()) return 0;
     if (!cuda_load_kernel_module()) return 0;
@@ -4407,8 +4503,17 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device) {
     /* Final norm + logits + argmax */
     if (!launch_rms_norm(g_dec_x, g_dec_x, d_norm, 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
     if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x, dim)) goto capture_fail;
-    if (!gemm_t_bf16_bf16_f32(g_dec_logits, g_dec_x_bf16, dTok, 1, dim, VOX_VOCAB_SIZE)) goto capture_fail;
-    if (!launch_argmax(g_dec_best, g_dec_logits, VOX_VOCAB_SIZE)) goto capture_fail;
+    if (use_logits_fused) {
+        if (!g_dec_best_packed || !g_fn_logits_best_init_u64 || !g_fn_logits_best_bf16_top1 || !g_fn_logits_best_unpack_u64) {
+            goto capture_fail;
+        }
+        if (!launch_logits_best_init_u64(g_dec_best_packed)) goto capture_fail;
+        if (!launch_logits_best_bf16_top1(g_dec_best_packed, g_dec_x_bf16, dTok, dim, VOX_VOCAB_SIZE)) goto capture_fail;
+        if (!launch_logits_best_unpack_u64(g_dec_best, g_dec_best_packed)) goto capture_fail;
+    } else {
+        if (!gemm_t_bf16_bf16_f32(g_dec_logits, g_dec_x_bf16, dTok, 1, dim, VOX_VOCAB_SIZE)) goto capture_fail;
+        if (!launch_argmax(g_dec_best, g_dec_logits, VOX_VOCAB_SIZE)) goto capture_fail;
+    }
     if (use_best_dtoh) {
         rr = cuMemcpyDtoHAsync(g_host_best, g_dec_best, sizeof(int), g_stream);
         if (rr != CUDA_SUCCESS) { log_cu_error("DtoH(best_graph_cap)", rr); goto capture_fail; }
@@ -4429,13 +4534,14 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device) {
     g_dec_graph_use_host_pos = use_host_pos;
     g_dec_graph_use_host_logical_pos = use_host_logical_pos;
     g_dec_graph_use_best_dtoh = use_best_dtoh;
+    g_dec_graph_use_logits_fused = use_logits_fused ? 1 : 0;
     if (vox_verbose >= 1) {
         int have_v2 = want_fp16 ? (g_fn_attn_dyn_fp16_v2 != 0) : (g_fn_attn_dyn_f32_v2 != 0);
         const char *attn = "v1";
         if (use_v4) attn = "v4";
         else if (use_v3) attn = "v3";
         else if (use_v2 && have_v2) attn = "v2";
-        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s)\n",
+        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s)\n",
                 want_fp16 ? "fp16" : "fp32",
                 attn,
                 use_merge_qkv ? ", merge_qkv" : "",
@@ -4444,7 +4550,8 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device) {
                 use_host_x ? ", host_x" : "",
                 use_host_pos ? ", host_pos" : "",
                 use_host_logical_pos ? ", host_logical_pos" : "",
-                use_best_dtoh ? ", best_dtoh" : "");
+                use_best_dtoh ? ", best_dtoh" : "",
+                use_logits_fused ? ", logits_fused" : "");
     }
     return 1;
 
@@ -4466,6 +4573,12 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     if (!vox_cuda_available()) return 0;
     if (!cuda_load_kernel_module()) return 0;
 
+    int want_logits_fused = 0;
+    if (!logits_or_null && logits_fused_enabled() &&
+        g_fn_logits_best_init_u64 && g_fn_logits_best_bf16_top1 && g_fn_logits_best_unpack_u64) {
+        want_logits_fused = 1;
+    }
+
     int want_fp16 = kv_cache_use_fp16();
     if (g_dec_graph_ready && g_dec_graph_kv_fp16 != -1 && g_dec_graph_kv_fp16 != want_fp16) {
         decoder_graph_destroy();
@@ -4474,10 +4587,13 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
         g_dec_graph_input_on_device != (input_on_device ? 1 : 0)) {
         decoder_graph_destroy();
     }
+    if (g_dec_graph_ready && g_dec_graph_use_logits_fused != want_logits_fused) {
+        decoder_graph_destroy();
+    }
 
     if (!g_dec_graph_ready) {
         if (!decoder_graph_prepare(ctx)) return 0;
-        if (!decoder_graph_capture(ctx, input_on_device)) return 0;
+        if (!decoder_graph_capture(ctx, input_on_device, want_logits_fused)) return 0;
     }
     if (!g_dec_graph_exec) return 0;
 
@@ -4735,17 +4851,28 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     if (!d_norm) return 0;
     if (!launch_rms_norm(g_dec_x, g_dec_x, d_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
 
-    /* Logits projection */
-    if (!ensure_buffer(&g_dec_logits, &g_cap_dec_logits, (size_t)VOX_VOCAB_SIZE * sizeof(float))) return 0;
+    /* Logits projection / best-token selection */
     if (!ensure_buffer(&g_dec_best, &g_cap_dec_best, sizeof(int))) return 0;
+    int use_logits_fused = (!logits_or_null && logits_fused_enabled() &&
+                            g_fn_logits_best_init_u64 && g_fn_logits_best_bf16_top1 && g_fn_logits_best_unpack_u64);
+    if (use_logits_fused) {
+        if (!ensure_buffer(&g_dec_best_packed, &g_cap_dec_best_packed, sizeof(unsigned long long))) return 0;
+    } else {
+        if (!ensure_buffer(&g_dec_logits, &g_cap_dec_logits, (size_t)VOX_VOCAB_SIZE * sizeof(float))) return 0;
+    }
 
     if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x, dim)) return 0;
     size_t bytes_emb = (size_t)VOX_VOCAB_SIZE * (size_t)dim * sizeof(uint16_t);
     CUdeviceptr dTok = bf16_cache_get(dec->tok_embeddings_bf16, bytes_emb);
     if (!dTok) return 0;
-    if (!gemm_t_bf16_bf16_f32(g_dec_logits, g_dec_x_bf16, dTok, 1, dim, VOX_VOCAB_SIZE)) return 0;
-
-    if (!launch_argmax(g_dec_best, g_dec_logits, VOX_VOCAB_SIZE)) return 0;
+    if (use_logits_fused) {
+        if (!launch_logits_best_init_u64(g_dec_best_packed)) return 0;
+        if (!launch_logits_best_bf16_top1(g_dec_best_packed, g_dec_x_bf16, dTok, dim, VOX_VOCAB_SIZE)) return 0;
+        if (!launch_logits_best_unpack_u64(g_dec_best, g_dec_best_packed)) return 0;
+    } else {
+        if (!gemm_t_bf16_bf16_f32(g_dec_logits, g_dec_x_bf16, dTok, 1, dim, VOX_VOCAB_SIZE)) return 0;
+        if (!launch_argmax(g_dec_best, g_dec_logits, VOX_VOCAB_SIZE)) return 0;
+    }
 
     int best_local = 2;
     int *best_ptr = g_host_best ? g_host_best : &best_local;
