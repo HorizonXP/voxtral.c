@@ -2123,6 +2123,113 @@ extern "C" __global__ void vox_argmax_f32(int *out_idx,
     if (tid == 0) out_idx[0] = sh_idx[0];
 }
 
+/* Fused top1-only logits projection (BF16 weights):
+ * - Computes argmax over vocab without materializing logits[].
+ *
+ * Intended for the common path where alternatives are disabled (logits_or_null==NULL).
+ * This is not expected to be faster than cuBLAS on all GPUs; keep it opt-in. */
+
+__device__ __forceinline__ float vox_bf16_to_f32(uint16_t h) {
+    return __uint_as_float(((uint32_t)h) << 16);
+}
+
+/* Map float bits to an unsigned integer that preserves ordering under unsigned
+ * comparisons. This allows packing into a u64 and using atomicMax. */
+__device__ __forceinline__ uint32_t vox_f32_to_ordered_u32(float f) {
+    uint32_t u = __float_as_uint(f);
+    uint32_t mask = (u & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    return u ^ mask;
+}
+
+extern "C" __global__ void vox_logits_best_init_u64(unsigned long long *best_packed) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) best_packed[0] = 0ULL;
+}
+
+extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_packed,
+                                                     const uint16_t *x_bf16,
+                                                     const uint16_t *tok_bf16,
+                                                     int dim,
+                                                     int vocab) {
+    /* Block = 256 threads (8 warps). Each block reduces a small tile of rows, then
+     * issues a single atomicMax on (best_logit, best_idx). */
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP; /* 32 */
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= vocab) return;
+
+    /* Dynamic shared: x_bf16[dim]. */
+    extern __shared__ uint16_t shx[];
+    for (int i = tid; i < dim; i += (int)blockDim.x) {
+        shx[i] = x_bf16[i];
+    }
+    __syncthreads();
+
+    float warp_best = -1.0e30f;
+    int warp_best_idx = 0;
+
+    /* Assign rows interleaved by warp for coalescing. */
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= vocab) continue;
+        const uint16_t *w = tok_bf16 + (size_t)row * (size_t)dim;
+
+        float sum = 0.0f;
+        for (int k = lane; k < dim; k += 32) {
+            float a = vox_bf16_to_f32(shx[k]);
+            float b = vox_bf16_to_f32(w[k]);
+            sum += a * b;
+        }
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) {
+            if (sum > warp_best || (sum == warp_best && row < warp_best_idx)) {
+                warp_best = sum;
+                warp_best_idx = row;
+            }
+        }
+    }
+
+    __shared__ float sh_best_val[WARPS];
+    __shared__ int sh_best_idx[WARPS];
+    if (lane == 0) {
+        sh_best_val[warp] = warp_best;
+        sh_best_idx[warp] = warp_best_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane == 0) {
+        float best = sh_best_val[0];
+        int best_idx = sh_best_idx[0];
+        for (int w = 1; w < WARPS; w++) {
+            float v = sh_best_val[w];
+            int idx = sh_best_idx[w];
+            if (v > best || (v == best && idx < best_idx)) {
+                best = v;
+                best_idx = idx;
+            }
+        }
+
+        uint32_t ord = vox_f32_to_ordered_u32(best);
+        /* Low bits are ~idx so ties prefer smaller idx under atomicMax. */
+        unsigned long long packed = ((unsigned long long)ord << 32) | (unsigned long long)(~(uint32_t)best_idx);
+        (void)atomicMax(best_packed, packed);
+    }
+}
+
+extern "C" __global__ void vox_logits_best_unpack_u64(int *out_idx,
+                                                     const unsigned long long *best_packed) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        unsigned long long packed = best_packed[0];
+        uint32_t low = (uint32_t)(packed & 0xffffffffu);
+        uint32_t idx = ~low;
+        out_idx[0] = (int)idx;
+    }
+}
+
 extern "C" __global__ void vox_masked_softmax_causal_inplace_f32(float *scores,
                                                                  int seq_q,
                                                                  int seq_k,
