@@ -215,28 +215,34 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
 
     int discard = ctx->kv_cache_len - keep;
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
-    size_t keep_bytes = (size_t)keep * kv_dim * sizeof(float);
 
-    for (int l = 0; l < VOX_DEC_LAYERS; l++) {
-        float *k_base = kv_cache_k_at(ctx, l, 0);
-        float *k_src  = kv_cache_k_at(ctx, l, discard);
-        float *v_base = kv_cache_v_at(ctx, l, 0);
-        float *v_src  = kv_cache_v_at(ctx, l, discard);
-        memmove(k_base, k_src, keep_bytes);
-        memmove(v_base, v_src, keep_bytes);
-    }
-
-#ifdef USE_CUDA
-    vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
-#endif
-
-    /* Host KV cache validity shifts with the compaction window. */
+    /* Host KV may be stale when we run the full CUDA decoder path. In that case,
+     * there is no point memmoving the entire cache. Only preserve the prefix
+     * we know is valid; the remainder will be lazily downloaded if we ever
+     * fall back to CPU attention. */
     int old_valid = ctx->kv_cache_host_valid_len;
     if (old_valid < 0) old_valid = 0;
     if (old_valid > ctx->kv_cache_len) old_valid = ctx->kv_cache_len;
     int new_valid = old_valid - discard;
     if (new_valid < 0) new_valid = 0;
     if (new_valid > keep) new_valid = keep;
+    size_t move_bytes = (size_t)new_valid * (size_t)kv_dim * sizeof(float);
+
+    for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+        float *k_base = kv_cache_k_at(ctx, l, 0);
+        float *k_src  = kv_cache_k_at(ctx, l, discard);
+        float *v_base = kv_cache_v_at(ctx, l, 0);
+        float *v_src  = kv_cache_v_at(ctx, l, discard);
+        if (move_bytes > 0) {
+            memmove(k_base, k_src, move_bytes);
+            memmove(v_base, v_src, move_bytes);
+        }
+    }
+
+#ifdef USE_CUDA
+    vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
+#endif
+
     ctx->kv_cache_host_valid_len = new_valid;
 
     ctx->kv_pos_offset += discard;
