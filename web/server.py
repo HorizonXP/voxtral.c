@@ -10,8 +10,9 @@ Goals:
 
 Implementation note:
 - This server shells out to the existing `./voxtral` CLI for inference.
-  This keeps the MVP simple. Performance and multi-session concurrency work
-  is tracked separately (see PRD issue #32 / child issues).
+- Batch requests use a persistent `./voxtral --worker` subprocess pool so the
+  model stays loaded across requests (improves latency for paste mode).
+- Realtime WS sessions still spawn one `voxtral` process per session.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import pathlib
 import shutil
 import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -39,6 +41,10 @@ class ServerConfig:
     model_dir: str
     default_interval_s: float
     max_sessions: int
+    batch_workers: int
+    batch_timeout_s: float
+    batch_startup_timeout_s: float
+    batch_warmup: bool
     api_key: Optional[str]
     extra_env: Dict[str, str]
 
@@ -123,37 +129,19 @@ async def _run_ffmpeg_to_wav(in_path: str, out_path: str) -> Tuple[int, bytes]:
     return proc.returncode, err or b""
 
 
-async def _run_voxtral_file(
-    *,
-    cfg: ServerConfig,
-    wav_path: str,
-    response_format: str,
-) -> web.StreamResponse:
-    env = os.environ.copy()
-    env.update(cfg.extra_env)
+def _write_silence_wav_16k_mono(path: str, *, seconds: float = 1.0) -> None:
+    n = int(max(0.0, seconds) * 16000)
+    # 16-bit PCM little-endian, mono, 16kHz.
+    pcm = b"\x00\x00" * n
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm)
 
-    cmd = [
-        cfg.voxtral_bin,
-        "-d",
-        cfg.model_dir,
-        "--silent",
-        "-i",
-        wav_path,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise web.HTTPInternalServerError(
-            text=f"voxtral failed (exit={proc.returncode}):\n{(err or b'').decode('utf-8', errors='replace')}\n",
-            content_type="text/plain",
-        )
 
-    text = (out or b"").decode("utf-8", errors="replace").strip()
+def _format_transcription_response(*, text: str, response_format: str) -> web.StreamResponse:
+    text = (text or "").strip()
 
     if response_format == "text":
         return web.Response(text=text + "\n", content_type="text/plain")
@@ -175,8 +163,247 @@ async def _run_voxtral_file(
     )
 
 
+class BatchWorkerError(RuntimeError):
+    pass
+
+
+class BatchWorker:
+    def __init__(self, *, cfg: ServerConfig, idx: int):
+        self._cfg = cfg
+        self._idx = idx
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._stderr_tail = bytearray()
+        self._stderr_tail_cap = 64 * 1024
+        self._next_id = 0
+
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    def stderr_tail_text(self) -> str:
+        return bytes(self._stderr_tail).decode("utf-8", errors="replace")
+
+    async def start(self) -> None:
+        env = os.environ.copy()
+        env.update(self._cfg.extra_env)
+        cmd = [
+            self._cfg.voxtral_bin,
+            "-d",
+            self._cfg.model_dir,
+            "--silent",
+            "--worker",
+        ]
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def pump_stderr() -> None:
+            assert self._proc is not None
+            try:
+                while True:
+                    data = await self._proc.stderr.read(4096)  # type: ignore[union-attr]
+                    if not data:
+                        break
+                    self._stderr_tail.extend(data)
+                    if len(self._stderr_tail) > self._stderr_tail_cap:
+                        del self._stderr_tail[: len(self._stderr_tail) - self._stderr_tail_cap]
+            except Exception:
+                pass
+
+        self._stderr_task = asyncio.create_task(pump_stderr())
+
+        # Wait for READY (protocol handshake) so /health can report true readiness.
+        assert self._proc.stdout is not None
+        deadline_s = self._cfg.batch_startup_timeout_s
+        try:
+            while True:
+                line = await asyncio.wait_for(
+                    self._proc.stdout.readline(), timeout=deadline_s  # type: ignore[union-attr]
+                )
+                if not line:
+                    raise BatchWorkerError("worker exited during startup")
+                s = line.decode("utf-8", errors="replace").strip()
+                if s == "READY":
+                    return
+                # Ignore any stray stdout lines; stderr is captured separately.
+        except asyncio.TimeoutError as e:
+            raise BatchWorkerError("timeout waiting for READY from worker") from e
+
+    async def close(self) -> None:
+        if self._proc is None:
+            return
+        proc = self._proc
+        self._proc = None
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.write(b"Q\n")
+                    await proc.stdin.drain()
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        finally:
+            if self._stderr_task and not self._stderr_task.done():
+                self._stderr_task.cancel()
+            self._stderr_task = None
+
+    async def transcribe(self, *, wav_path: str, timeout_s: float) -> str:
+        if self._proc is None or self._proc.returncode is not None:
+            raise BatchWorkerError("worker not running")
+        if self._proc.stdin is None or self._proc.stdout is None:
+            raise BatchWorkerError("worker pipes unavailable")
+
+        self._next_id += 1
+        req_id = self._next_id
+        cmd = f"T\t{req_id}\t{wav_path}\n".encode("utf-8", errors="strict")
+        try:
+            self._proc.stdin.write(cmd)
+            await self._proc.stdin.drain()
+        except Exception as e:
+            raise BatchWorkerError(f"failed to write request to worker: {e}") from e
+
+        try:
+            while True:
+                line = await asyncio.wait_for(
+                    self._proc.stdout.readline(), timeout=timeout_s  # type: ignore[union-attr]
+                )
+                if not line:
+                    raise BatchWorkerError("worker exited while waiting for response")
+                s = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if s == "READY":
+                    continue
+                if not s.startswith("R\t"):
+                    continue
+                parts = s.split("\t", 3)
+                if len(parts) < 4:
+                    continue
+                _tag, rid_s, status, payload = parts
+                try:
+                    rid = int(rid_s)
+                except Exception:
+                    continue
+                if rid != req_id:
+                    # Shouldn't happen (we serialize per worker), but be defensive.
+                    continue
+                if status == "OK":
+                    return payload.strip()
+                if status == "ERR":
+                    raise BatchWorkerError(payload.strip() or "transcription failed")
+                raise BatchWorkerError(f"unknown status from worker: {status}")
+        except asyncio.TimeoutError as e:
+            raise BatchWorkerError(
+                f"timeout waiting for worker response ({timeout_s}s)"
+            ) from e
+
+
+class BatchWorkerPool:
+    def __init__(self, *, cfg: ServerConfig):
+        self._cfg = cfg
+        self._q: asyncio.Queue[BatchWorker] = asyncio.Queue()
+        self._workers: list[BatchWorker] = []
+
+    async def start(self) -> None:
+        n = max(0, int(self._cfg.batch_workers))
+        for i in range(n):
+            w = BatchWorker(cfg=self._cfg, idx=i)
+            await w.start()
+            self._workers.append(w)
+            self._q.put_nowait(w)
+
+    async def close(self) -> None:
+        for w in self._workers:
+            try:
+                await w.close()
+            except Exception:
+                pass
+        self._workers.clear()
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except Exception:
+                break
+
+    def ready_count(self) -> int:
+        return sum(1 for w in self._workers if w.alive)
+
+    async def transcribe(self, *, wav_path: str) -> str:
+        if not self._workers:
+            raise BatchWorkerError("batch workers disabled")
+        w = await self._q.get()
+        try:
+            if not w.alive:
+                await w.close()
+                await w.start()
+            return await w.transcribe(wav_path=wav_path, timeout_s=self._cfg.batch_timeout_s)
+        finally:
+            self._q.put_nowait(w)
+
+
+async def _run_voxtral_file(
+    *,
+    cfg: ServerConfig,
+    wav_path: str,
+    timeout_s: float,
+) -> str:
+    env = os.environ.copy()
+    env.update(cfg.extra_env)
+
+    cmd = [
+        cfg.voxtral_bin,
+        "-d",
+        cfg.model_dir,
+        "--silent",
+        "-i",
+        wav_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill()
+        out, err = await proc.communicate()
+        raise web.HTTPGatewayTimeout(
+            text="voxtral timed out\n",
+            content_type="text/plain",
+        )
+    if proc.returncode != 0:
+        raise web.HTTPInternalServerError(
+            text=f"voxtral failed (exit={proc.returncode}):\n{(err or b'').decode('utf-8', errors='replace')}\n",
+            content_type="text/plain",
+        )
+
+    return (out or b"").decode("utf-8", errors="replace").strip()
+
+
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "ts_ms": _now_ms()})
+    cfg: ServerConfig = request.app["cfg"]
+    pool: Optional[BatchWorkerPool] = request.app.get("batch_pool")
+    return web.json_response(
+        {
+            "ok": True,
+            "ts_ms": _now_ms(),
+            "batch_workers": cfg.batch_workers,
+            "batch_ready": (pool.ready_count() if pool else 0),
+        }
+    )
 
 
 async def handle_index(request: web.Request) -> web.FileResponse:
@@ -229,9 +456,20 @@ async def handle_transcriptions(request: web.Request) -> web.StreamResponse:
                 content_type="text/plain",
             )
 
-        return await _run_voxtral_file(
-            cfg=cfg, wav_path=wav_path, response_format=response_format
-        )
+        # Batch path: prefer the hot worker pool (keeps model loaded across requests).
+        pool: Optional[BatchWorkerPool] = request.app.get("batch_pool")
+        if pool is not None and cfg.batch_workers > 0:
+            try:
+                text = await pool.transcribe(wav_path=wav_path)
+            except BatchWorkerError as e:
+                raise web.HTTPInternalServerError(
+                    text=f"batch worker failed: {e}\n",
+                    content_type="text/plain",
+                )
+        else:
+            text = await _run_voxtral_file(cfg=cfg, wav_path=wav_path, timeout_s=cfg.batch_timeout_s)
+
+        return _format_transcription_response(text=text, response_format=response_format)
 
 
 async def handle_ws_realtime(request: web.Request) -> web.StreamResponse:
@@ -485,6 +723,30 @@ def main() -> int:
         help="Max concurrent realtime WS sessions (MVP default: 1).",
     )
     ap.add_argument(
+        "--batch-workers",
+        type=int,
+        default=1,
+        help="Number of persistent batch workers for /v1/audio/transcriptions (default: 1).",
+    )
+    ap.add_argument(
+        "--batch-timeout",
+        type=float,
+        default=600.0,
+        help="Max seconds to wait for a batch transcription (default: 600).",
+    )
+    ap.add_argument(
+        "--batch-startup-timeout",
+        type=float,
+        default=60.0,
+        help="Max seconds to wait for batch worker startup (default: 60).",
+    )
+    ap.add_argument(
+        "--batch-warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run a short warmup transcription on startup to avoid first-request CUDA autotune/graph-capture latency.",
+    )
+    ap.add_argument(
         "--api-key",
         default=os.environ.get("VOXTRAL_API_KEY", ""),
         help="If set, require Authorization: Bearer <token> (OpenAI style).",
@@ -521,6 +783,10 @@ def main() -> int:
         model_dir=str(model_dir_path),
         default_interval_s=args.interval,
         max_sessions=max(1, int(args.max_sessions)),
+        batch_workers=max(0, int(args.batch_workers)),
+        batch_timeout_s=float(args.batch_timeout),
+        batch_startup_timeout_s=float(args.batch_startup_timeout),
+        batch_warmup=bool(args.batch_warmup),
         api_key=(args.api_key.strip() or None),
         extra_env=_parse_env_kv(args.env),
     )
@@ -529,10 +795,38 @@ def main() -> int:
     if not static_dir.is_dir():
         raise SystemExit(f"static dir not found: {static_dir}")
 
-    app = web.Application(middlewares=[cors_middleware])
+    # Raise default upload limit (aiohttp default is 1 MiB).
+    app = web.Application(
+        middlewares=[cors_middleware],
+        client_max_size=200 * 1024 * 1024,
+    )
     app["cfg"] = cfg
     app["static_dir"] = static_dir
     app["session_sem"] = asyncio.Semaphore(cfg.max_sessions)
+    app["batch_pool"] = BatchWorkerPool(cfg=cfg)
+
+    async def _on_startup(app: web.Application) -> None:
+        pool: BatchWorkerPool = app["batch_pool"]
+        if cfg.batch_workers > 0:
+            await pool.start()
+            if cfg.batch_warmup:
+                print(f"warming up {cfg.batch_workers} batch worker(s)...")
+                with tempfile.TemporaryDirectory(prefix="voxtral_warmup_") as td:
+                    wav_path = str(pathlib.Path(td) / "silence_1s.wav")
+                    _write_silence_wav_16k_mono(wav_path, seconds=1.0)
+                    for _ in range(cfg.batch_workers):
+                        try:
+                            await pool.transcribe(wav_path=wav_path)
+                        except Exception as e:
+                            print(f"warmup failed: {e}")
+                            break
+
+    async def _on_cleanup(app: web.Application) -> None:
+        pool: BatchWorkerPool = app["batch_pool"]
+        await pool.close()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/health", handle_health)
@@ -541,7 +835,8 @@ def main() -> int:
     app.router.add_static("/static/", path=str(static_dir), show_index=False)
 
     print(
-        f"voxtral server listening on http://{cfg.host}:{cfg.port} (max_sessions={cfg.max_sessions})"
+        f"voxtral server listening on http://{cfg.host}:{cfg.port} "
+        f"(max_sessions={cfg.max_sessions}, batch_workers={cfg.batch_workers})"
     )
     if cfg.api_key:
         print("auth enabled: set Authorization: Bearer <token>")

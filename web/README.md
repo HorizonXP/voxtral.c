@@ -6,7 +6,10 @@ This folder contains a small self-hostable web server that exposes:
 - `GET  /v1/audio/transcriptions/realtime` (WebSocket realtime dictation)
 - a minimal browser mic demo at `/`
 
-The MVP shells out to the `voxtral` CLI for inference (one `voxtral` process per realtime session).
+The MVP shells out to the `voxtral` CLI for inference:
+
+- Batch: a small pool of persistent `voxtral --worker` subprocesses (keeps the model loaded across requests).
+- Realtime: one `voxtral` process per WebSocket session.
 
 ## Prereqs
 
@@ -33,6 +36,12 @@ From the repo root:
 # Example: enable the fast CUDA path for voxtral subprocesses.
 env VOX_CUDA_FAST=1 python3 web/server.py
 ```
+
+Batch worker knobs:
+
+- `--batch-workers N` (default: 1)
+- `--batch-timeout SECS` (default: 600)
+- `--no-batch-warmup` (disable startup warmup that avoids first-request autotune/graph-capture latency)
 
 Then open:
 
@@ -72,4 +81,3 @@ WebSocket endpoint:
 
 The client sends binary frames containing raw `PCM16LE @ 16kHz mono` audio.
 See `web/PROTOCOL.md` for the wire format and events.
-
