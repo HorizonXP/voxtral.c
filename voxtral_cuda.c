@@ -132,6 +132,9 @@ static size_t g_hostregs_bytes = 0;
 /* cuBLASLt workspace + algo cache (used primarily for M=1 matmuls). */
 static CUdeviceptr g_lt_workspace = 0;
 static size_t g_lt_workspace_cap = 0;
+/* Scratch output buffer used by cuBLASLt autotune (avoid clobbering real C). */
+static CUdeviceptr g_lt_tune_out = 0;
+static size_t g_lt_tune_out_cap = 0;
 
 static size_t cublaslt_max_workspace_bytes(void) {
     /* This affects algo selection for M=1 matmuls. Bigger workspaces can unlock
@@ -159,6 +162,8 @@ typedef struct {
     cublasLtMatrixLayout_t b;
     cublasLtMatrixLayout_t c;
     size_t workspace_bytes;
+    int tuned;
+    float tuned_ms;
     int valid;
 } lt_algo_entry_t;
 
@@ -279,6 +284,60 @@ static int logits_fused_enabled(void) {
 static int env_truthy(const char *name) {
     const char *v = getenv(name);
     return v && v[0] && v[0] != '0';
+}
+
+static int cublaslt_autotune_enabled(void) {
+    /* Autotune cuBLASLt algo selection for M=1 decoder GEMMs. This is intended
+     * to be a best-effort speed knob; default on under VOX_CUDA_FAST. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    if (env_truthy("VOX_DISABLE_CUBLASLT_AUTOTUNE")) { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_CUBLASLT_AUTOTUNE");
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = cuda_fast_enabled();
+    return cached;
+}
+
+static int cublaslt_autotune_top(void) {
+    /* Number of heuristic algos to consider during tuning. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    int v = 8;
+    const char *env = getenv("VOX_CUDA_CUBLASLT_AUTOTUNE_TOP");
+    if (env && env[0]) {
+        char *end = NULL;
+        long n = strtol(env, &end, 10);
+        if (end != env) v = (int)n;
+    }
+    if (v < 1) v = 1;
+    if (v > 32) v = 32;
+    cached = v;
+    return cached;
+}
+
+static int cublaslt_autotune_iters(int N) {
+    /* Small M=1 GEMMs are microsecond-ish; use a larger loop to reduce timer noise.
+     * Very large N (logits) is expensive, so cap iterations automatically. */
+    static int cached = -1;
+    if (cached == -1) {
+        int v = 25;
+        const char *env = getenv("VOX_CUDA_CUBLASLT_AUTOTUNE_ITERS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long n = strtol(env, &end, 10);
+            if (end != env) v = (int)n;
+        }
+        if (v < 1) v = 1;
+        if (v > 200) v = 200;
+        cached = v;
+    }
+    int iters = cached;
+    if (N >= 32768) {
+        if (iters > 5) iters = 5;
+    } else if (N >= 8192) {
+        if (iters > 10) iters = 10;
+    }
+    return iters;
 }
 
 static int merge_qkv_enabled(void) {
@@ -1891,9 +1950,183 @@ static int launch_logits_best_unpack_u64(CUdeviceptr out_idx,
     return 1;
 }
 
+static int lt_get_algo_t_bf16(int M, int K, int N,
+                              cublasLtMatmulAlgo_t *out_algo,
+                              size_t *out_ws,
+                              cublasLtMatmulDesc_t *out_op,
+                              cublasLtMatrixLayout_t *out_a,
+                              cublasLtMatrixLayout_t *out_b,
+                              cublasLtMatrixLayout_t *out_c);
+
 static int ensure_lt_workspace(size_t needed_bytes) {
     if (needed_bytes == 0) return 1;
     return ensure_buffer(&g_lt_workspace, &g_lt_workspace_cap, needed_bytes);
+}
+
+static lt_algo_entry_t *lt_cache_find(int M, int K, int N) {
+    for (int i = 0; i < g_lt_algos_len; i++) {
+        if (g_lt_algos[i].valid &&
+            g_lt_algos[i].M == M &&
+            g_lt_algos[i].K == K &&
+            g_lt_algos[i].N == N) {
+            return &g_lt_algos[i];
+        }
+    }
+    return NULL;
+}
+
+static int stream_is_capturing(void) {
+    /* Avoid autotune (extra matmuls/events) during CUDA Graph capture. */
+    if (!g_stream) return 0;
+    CUstreamCaptureStatus st = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (cuStreamIsCapturing(g_stream, &st) != CUDA_SUCCESS) return 0;
+    return st != CU_STREAM_CAPTURE_STATUS_NONE;
+}
+
+static int lt_autotune_t_bf16(int M, int K, int N,
+                              CUdeviceptr dA_bf16,
+                              CUdeviceptr dB_bf16) {
+    if (!cublaslt_autotune_enabled()) return 1;
+    if (!g_lt_handle) return 1;
+    if (!dA_bf16 || !dB_bf16) return 1;
+    if (M != 1) return 1; /* current code only uses Lt for M=1 */
+    if (stream_is_capturing()) return 1;
+
+    /* Ensure we have a cache entry (op/layouts). */
+    lt_algo_entry_t *e = lt_cache_find(M, K, N);
+    if (!e) {
+        cublasLtMatmulAlgo_t tmp_algo;
+        size_t tmp_ws = 0;
+        if (!lt_get_algo_t_bf16(M, K, N, &tmp_algo, &tmp_ws, NULL, NULL, NULL, NULL)) {
+            return 1;
+        }
+        e = lt_cache_find(M, K, N);
+        if (!e) return 1;
+    }
+
+    if (e->tuned) return 1;
+
+    /* Query a handful of heuristic algos under the current workspace cap, then
+     * time them once and cache the fastest. */
+    int top = cublaslt_autotune_top();
+    cublasLtMatmulHeuristicResult_t heur[32];
+    int returned = 0;
+
+    cublasLtMatmulPreference_t pref = NULL;
+    cublasStatus_t st;
+    st = cublasLtMatmulPreferenceCreate(&pref);
+    if (st != CUBLAS_STATUS_SUCCESS) { e->tuned = 1; return 1; }
+
+    size_t max_ws = cublaslt_max_workspace_bytes();
+    (void)cublasLtMatmulPreferenceSetAttribute(pref,
+                                               CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &max_ws, sizeof(max_ws));
+
+    st = cublasLtMatmulAlgoGetHeuristic(g_lt_handle,
+                                        e->op,
+                                        e->a, e->b,
+                                        e->c, e->c,
+                                        pref,
+                                        top, heur, &returned);
+    cublasLtMatmulPreferenceDestroy(pref);
+    pref = NULL;
+
+    if (st != CUBLAS_STATUS_SUCCESS || returned <= 0) { e->tuned = 1; return 1; }
+
+    /* Scratch output buffer: [M,N] f32. */
+    size_t bytes_c = (size_t)M * (size_t)N * sizeof(float);
+    if (!ensure_buffer(&g_lt_tune_out, &g_lt_tune_out_cap, bytes_c)) {
+        e->tuned = 1;
+        return 1;
+    }
+
+    /* Time each candidate using events. */
+    CUevent ev0 = 0, ev1 = 0;
+    if (cuEventCreate(&ev0, CU_EVENT_DEFAULT) != CUDA_SUCCESS ||
+        cuEventCreate(&ev1, CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
+        if (ev0) (void)cuEventDestroy(ev0);
+        if (ev1) (void)cuEventDestroy(ev1);
+        e->tuned = 1;
+        return 1;
+    }
+
+    float best_ms = 1.0e30f;
+    cublasLtMatmulAlgo_t best_algo = e->algo;
+    size_t best_ws = e->workspace_bytes;
+    int best_valid = 0;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    for (int i = 0; i < returned; i++) {
+        size_t ws = heur[i].workspaceSize;
+        if (!ensure_lt_workspace(ws)) continue;
+
+        /* Warm-up (also ensures any pending weight uploads complete). */
+        st = cublasLtMatmul(g_lt_handle,
+                            e->op,
+                            &alpha,
+                            (const void *)(uintptr_t)dA_bf16, e->a,
+                            (const void *)(uintptr_t)dB_bf16, e->b,
+                            &beta,
+                            (const void *)(uintptr_t)g_lt_tune_out, e->c,
+                            (void *)(uintptr_t)g_lt_tune_out, e->c,
+                            &heur[i].algo,
+                            (void *)(uintptr_t)g_lt_workspace, ws,
+                            (cudaStream_t)g_stream);
+        if (st != CUBLAS_STATUS_SUCCESS) continue;
+
+        int iters = cublaslt_autotune_iters(N);
+        if (iters < 1) iters = 1;
+
+        if (cuEventRecord(ev0, g_stream) != CUDA_SUCCESS) continue;
+        for (int t = 0; t < iters; t++) {
+            st = cublasLtMatmul(g_lt_handle,
+                                e->op,
+                                &alpha,
+                                (const void *)(uintptr_t)dA_bf16, e->a,
+                                (const void *)(uintptr_t)dB_bf16, e->b,
+                                &beta,
+                                (const void *)(uintptr_t)g_lt_tune_out, e->c,
+                                (void *)(uintptr_t)g_lt_tune_out, e->c,
+                                &heur[i].algo,
+                                (void *)(uintptr_t)g_lt_workspace, ws,
+                                (cudaStream_t)g_stream);
+            if (st != CUBLAS_STATUS_SUCCESS) break;
+        }
+        if (st != CUBLAS_STATUS_SUCCESS) continue;
+        if (cuEventRecord(ev1, g_stream) != CUDA_SUCCESS) continue;
+        if (cuEventSynchronize(ev1) != CUDA_SUCCESS) continue;
+
+        float ms = 0.0f;
+        if (cuEventElapsedTime(&ms, ev0, ev1) != CUDA_SUCCESS) continue;
+        ms = ms / (float)iters;
+
+        if (ms > 0.0f && ms < best_ms) {
+            best_ms = ms;
+            best_algo = heur[i].algo;
+            best_ws = ws;
+            best_valid = 1;
+        }
+    }
+
+    (void)cuEventDestroy(ev0);
+    (void)cuEventDestroy(ev1);
+
+    if (best_valid) {
+        e->algo = best_algo;
+        e->workspace_bytes = best_ws;
+        e->tuned_ms = best_ms;
+        e->tuned = 1;
+        if (vox_verbose >= 2) {
+            fprintf(stderr, "[cuda] cublasLt autotune: M=%d K=%d N=%d -> %.4f ms (ws=%zu)\n",
+                    M, K, N, (double)best_ms, best_ws);
+        }
+    } else {
+        e->tuned = 1;
+    }
+
+    return 1;
 }
 
 static int lt_get_algo_t_bf16(int M, int K, int N,
@@ -1981,6 +2214,8 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
             .b = b,
             .c = c,
             .workspace_bytes = heur.workspaceSize,
+            .tuned = 0,
+            .tuned_ms = 0.0f,
             .valid = 1,
         };
         if (out_op) *out_op = op;
@@ -2016,6 +2251,8 @@ static int gemm_t_bf16_bf16_f32_beta(CUdeviceptr dC,
 
     const char *no_lt = getenv("VOX_DISABLE_CUBLASLT");
     if (g_lt_handle && M == 1 && (!no_lt || !no_lt[0] || no_lt[0] == '0')) {
+        (void)lt_autotune_t_bf16(M, K, N, dA_bf16, dB_bf16);
+
         cublasLtMatmulAlgo_t algo;
         size_t ws = 0;
         cublasLtMatmulDesc_t op = NULL;
@@ -2612,6 +2849,9 @@ void vox_cuda_shutdown(void) {
     shutdown_dev_free_ptr(&g_lt_workspace);
     g_lt_workspace = 0;
     g_lt_workspace_cap = 0;
+    shutdown_dev_free_ptr(&g_lt_tune_out);
+    g_lt_tune_out = 0;
+    g_lt_tune_out_cap = 0;
     for (int i = 0; i < g_lt_algos_len; i++) {
         if (g_lt_algos[i].op) cublasLtMatmulDescDestroy(g_lt_algos[i].op);
         if (g_lt_algos[i].a) cublasLtMatrixLayoutDestroy(g_lt_algos[i].a);
@@ -4068,7 +4308,7 @@ static void decoder_graph_destroy(void) {
     g_dec_logical_pos_dev = 0;
 }
 
-static int decoder_graph_prepare(vox_ctx_t *ctx) {
+static int decoder_graph_prepare(vox_ctx_t *ctx, int want_logits_fused) {
     if (!ctx) return 0;
     if (!vox_cuda_available()) return 0;
     if (!cuda_load_kernel_module()) return 0;
@@ -4175,8 +4415,10 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
         shapes[n_shapes++] = (lt_shape_t){ 1, dim, use_merge_ffn13 ? (2 * hidden) : hidden };
         /* W2 */
         shapes[n_shapes++] = (lt_shape_t){ 1, hidden, dim };
-        /* Logits */
-        shapes[n_shapes++] = (lt_shape_t){ 1, dim, VOX_VOCAB_SIZE };
+        /* Logits (only needed when we materialize logits[]). */
+        if (!want_logits_fused) {
+            shapes[n_shapes++] = (lt_shape_t){ 1, dim, VOX_VOCAB_SIZE };
+        }
         size_t max_ws = 0;
         for (int i = 0; i < n_shapes; i++) {
             cublasLtMatmulAlgo_t algo;
@@ -4195,6 +4437,14 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
      * while warming, disable graphs (memory pressure => pointers may not stay stable). */
     uint64_t ev_before = g_bf16_evictions;
     vox_decoder_t *dec = &ctx->decoder;
+    CUdeviceptr tune_Wqkv0 = 0;
+    CUdeviceptr tune_Wq0 = 0;
+    CUdeviceptr tune_Wk0 = 0;
+    CUdeviceptr tune_Wv0 = 0;
+    CUdeviceptr tune_Wo0 = 0;
+    CUdeviceptr tune_W130 = 0;
+    CUdeviceptr tune_W10 = 0;
+    CUdeviceptr tune_W20 = 0;
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
         size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
@@ -4203,29 +4453,52 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
         if (use_merge_qkv) {
-            if (!bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                         l->wq_weight_bf16, bytes_wq,
-                                         l->wk_weight_bf16, bytes_wkv,
-                                         l->wv_weight_bf16, bytes_wkv)) {
+            CUdeviceptr d = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                    l->wq_weight_bf16, bytes_wq,
+                                                    l->wk_weight_bf16, bytes_wkv,
+                                                    l->wv_weight_bf16, bytes_wkv);
+            if (!d) {
                 return 0;
             }
+            if (layer == 0) tune_Wqkv0 = d;
         } else {
-            if (!bf16_cache_get(l->wq_weight_bf16, bytes_wq)) return 0;
-            if (!bf16_cache_get(l->wk_weight_bf16, bytes_wkv)) return 0;
-            if (!bf16_cache_get(l->wv_weight_bf16, bytes_wkv)) return 0;
+            CUdeviceptr d;
+            d = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+            if (!d) return 0;
+            if (layer == 0) tune_Wq0 = d;
+            d = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+            if (!d) return 0;
+            if (layer == 0) tune_Wk0 = d;
+            d = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+            if (!d) return 0;
+            if (layer == 0) tune_Wv0 = d;
         }
-        if (!bf16_cache_get(l->wo_weight_bf16, bytes_wo)) return 0;
+        {
+            CUdeviceptr d = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (!d) return 0;
+            if (layer == 0) tune_Wo0 = d;
+        }
         if (use_merge_ffn13) {
-            if (!bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                         l->w1_weight_bf16, bytes_w1,
-                                         l->w3_weight_bf16, bytes_w1)) {
+            CUdeviceptr d = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                    l->w1_weight_bf16, bytes_w1,
+                                                    l->w3_weight_bf16, bytes_w1);
+            if (!d) {
                 return 0;
             }
+            if (layer == 0) tune_W130 = d;
         } else {
-            if (!bf16_cache_get(l->w1_weight_bf16, bytes_w1)) return 0;
-            if (!bf16_cache_get(l->w3_weight_bf16, bytes_w1)) return 0;
+            CUdeviceptr d;
+            d = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+            if (!d) return 0;
+            if (layer == 0) tune_W10 = d;
+            d = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+            if (!d) return 0;
         }
-        if (!bf16_cache_get(l->w2_weight_bf16, bytes_w2)) return 0;
+        {
+            CUdeviceptr d = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!d) return 0;
+            if (layer == 0) tune_W20 = d;
+        }
 
         if (!f32_cache_get(l->attention_norm, (size_t)dim * sizeof(float))) return 0;
         if (!f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float))) return 0;
@@ -4236,7 +4509,40 @@ static int decoder_graph_prepare(vox_ctx_t *ctx) {
     }
     if (!f32_cache_get(dec->norm, (size_t)dim * sizeof(float))) return 0;
     size_t bytes_tok = (size_t)VOX_VOCAB_SIZE * (size_t)dim * sizeof(uint16_t);
-    if (!bf16_cache_get(dec->tok_embeddings_bf16, bytes_tok)) return 0;
+    CUdeviceptr tune_Tok = bf16_cache_get(dec->tok_embeddings_bf16, bytes_tok);
+    if (!tune_Tok) return 0;
+
+    /* Autotune cuBLASLt algos now (before capture), so the captured graph only
+     * observes cached algos + a stable workspace pointer. */
+    if (g_lt_handle && cublaslt_autotune_enabled()) {
+        int qkv_dim = q_dim + 2 * kv_dim;
+        if (use_merge_qkv && tune_Wqkv0) {
+            (void)lt_autotune_t_bf16(1, dim, qkv_dim, g_dec_x_bf16, tune_Wqkv0);
+        } else if (!use_merge_qkv && tune_Wq0 && tune_Wk0 && tune_Wv0) {
+            (void)lt_autotune_t_bf16(1, dim, q_dim, g_dec_x_bf16, tune_Wq0);
+            (void)lt_autotune_t_bf16(1, dim, kv_dim, g_dec_x_bf16, tune_Wk0);
+            (void)lt_autotune_t_bf16(1, dim, kv_dim, g_dec_x_bf16, tune_Wv0);
+        }
+
+        if (tune_Wo0) {
+            (void)lt_autotune_t_bf16(1, q_dim, dim, g_dec_attn_bf16, tune_Wo0);
+        }
+
+        if (use_merge_ffn13 && tune_W130) {
+            (void)lt_autotune_t_bf16(1, dim, 2 * hidden, g_dec_x_bf16, tune_W130);
+        } else if (!use_merge_ffn13 && tune_W10) {
+            /* W1 and W3 share the same shape; tuning one is sufficient. */
+            (void)lt_autotune_t_bf16(1, dim, hidden, g_dec_x_bf16, tune_W10);
+        }
+
+        if (tune_W20) {
+            (void)lt_autotune_t_bf16(1, hidden, dim, g_dec_gate_bf16, tune_W20);
+        }
+
+        if (!want_logits_fused && tune_Tok) {
+            (void)lt_autotune_t_bf16(1, dim, VOX_VOCAB_SIZE, g_dec_x_bf16, tune_Tok);
+        }
+    }
 
     if (g_bf16_evictions != ev_before) return 0;
     return 1;
@@ -4646,7 +4952,7 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     }
 
     if (!g_dec_graph_ready) {
-        if (!decoder_graph_prepare(ctx)) return 0;
+        if (!decoder_graph_prepare(ctx, want_logits_fused)) return 0;
         if (!decoder_graph_capture(ctx, input_on_device, want_logits_fused)) return 0;
     }
     if (!g_dec_graph_exec) return 0;
