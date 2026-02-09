@@ -84,6 +84,22 @@ async def cors_middleware(request: web.Request, handler):
     return resp
 
 
+async def _ws_close_with_timeout(ws: web.WebSocketResponse, timeout_s: float = 2.0) -> None:
+    # A misbehaving client can stall the close handshake; don't let this handler hang.
+    try:
+        await asyncio.wait_for(ws.close(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        try:
+            ws.force_close()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            ws.force_close()
+        except Exception:
+            pass
+
+
 async def _run_ffmpeg_to_wav(in_path: str, out_path: str) -> Tuple[int, bytes]:
     # Decode any input format ffmpeg supports to 16kHz mono WAV.
     cmd = [
@@ -229,13 +245,8 @@ async def handle_ws_realtime(request: web.Request) -> web.StreamResponse:
     stdout_task: Optional[asyncio.Task] = None
     stderr_task: Optional[asyncio.Task] = None
 
-    try:
-        await asyncio.wait_for(sem.acquire(), timeout=0.05)
-        acquired = True
-    except asyncio.TimeoutError:
-        raise web.HTTPTooManyRequests(
-            text="Too many active sessions\n", content_type="text/plain"
-        )
+    await sem.acquire()
+    acquired = True
     try:
         await ws.prepare(request)
 
@@ -358,7 +369,7 @@ async def handle_ws_realtime(request: web.Request) -> web.StreamResponse:
                         json.dumps({"type": "transcript.done", "text": full_text})
                     )
             finally:
-                await ws.close()
+                await _ws_close_with_timeout(ws)
 
         try:
             async for msg in ws:
@@ -420,14 +431,18 @@ async def handle_ws_realtime(request: web.Request) -> web.StreamResponse:
                             }
                         )
                     )
-                await ws.close()
+                await _ws_close_with_timeout(ws)
 
             # If the client ended the WS without "stop", ensure we close our side too.
             if not ws.closed:
-                await ws.close()
+                await _ws_close_with_timeout(ws)
 
         return ws
     finally:
+        # Ensure we don't leave dangling tasks on timeout paths.
+        for t in (stdout_task, stderr_task):
+            if t and not t.done():
+                t.cancel()
         if acquired:
             sem.release()
 
