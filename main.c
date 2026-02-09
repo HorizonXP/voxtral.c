@@ -28,12 +28,13 @@ static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
-    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --from-mic) [options]\n\n", prog);
+    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --from-mic | --worker) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d <dir>      Model directory (with consolidated.safetensors, tekken.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "  --from-mic    Capture from default microphone (macOS/Windows only, Ctrl+C to stop)\n");
+    fprintf(stderr, "  --worker      Persistent batch worker: read tab-delimited requests from stdin\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
@@ -45,6 +46,15 @@ static void usage(const char *prog) {
 /* Drain pending tokens from stream and print to stdout */
 static int first_token = 1;
 static float alt_cutoff = -1; /* <0 means disabled */
+
+static void sanitize_single_line(char *s) {
+    /* worker protocol is line-delimited; keep payloads on a single line */
+    if (!s) return;
+    for (char *p = s; *p; p++) {
+        if (*p == '\n' || *p == '\r' || *p == '\t')
+            *p = ' ';
+    }
+}
 
 static void drain_tokens(vox_stream_t *s) {
     if (alt_cutoff < 0) {
@@ -124,6 +134,7 @@ int main(int argc, char **argv) {
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
     int use_mic = 0;
+    int use_worker = 0;
     float interval = -1.0f; /* <0 means use default */
 
     for (int i = 1; i < argc; i++) {
@@ -147,6 +158,8 @@ int main(int argc, char **argv) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--from-mic") == 0) {
             use_mic = 1;
+        } else if (strcmp(argv[i], "--worker") == 0) {
+            use_worker = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -161,12 +174,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || (!input_wav && !use_stdin && !use_mic)) {
+    if (!model_dir || (!input_wav && !use_stdin && !use_mic && !use_worker)) {
         usage(argv[0]);
         return 1;
     }
-    if ((input_wav ? 1 : 0) + use_stdin + use_mic > 1) {
-        fprintf(stderr, "Error: -i, --stdin, and --from-mic are mutually exclusive\n");
+    if ((input_wav ? 1 : 0) + use_stdin + use_mic + use_worker > 1) {
+        fprintf(stderr, "Error: -i, --stdin, --from-mic, and --worker are mutually exclusive\n");
         return 1;
     }
 
@@ -192,25 +205,89 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Model load: %.0f ms\n", load_ms);
     }
 
-    vox_stream_t *s = vox_stream_init(ctx);
-    if (!s) {
-        fprintf(stderr, "Failed to init stream\n");
-        vox_free(ctx);
-        return 1;
-    }
-    if (alt_cutoff >= 0)
-        vox_stream_set_alt(s, 3, alt_cutoff);
-    if (interval > 0) {
-        vox_set_processing_interval(s, interval);
-        feed_chunk = (int)(interval * VOX_SAMPLE_RATE);
-        if (feed_chunk < 160) feed_chunk = 160;
-        if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
+    vox_stream_t *s = NULL;
+    if (!use_worker) {
+        s = vox_stream_init(ctx);
+        if (!s) {
+            fprintf(stderr, "Failed to init stream\n");
+            vox_free(ctx);
+            return 1;
+        }
+        if (alt_cutoff >= 0)
+            vox_stream_set_alt(s, 3, alt_cutoff);
+        if (interval > 0) {
+            vox_set_processing_interval(s, interval);
+            feed_chunk = (int)(interval * VOX_SAMPLE_RATE);
+            if (feed_chunk < 160) feed_chunk = 160;
+            if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
+        }
     }
 
     double t0_run_ms = 0;
-    if (!use_mic) t0_run_ms = vox_get_time_ms();
+    if (!use_mic && !use_worker) t0_run_ms = vox_get_time_ms();
 
-    if (use_mic) {
+    if (use_worker) {
+        /* Persistent worker protocol.
+         *
+         * stdin requests:
+         *   READY\n                              (worker -> client, once at startup)
+         *   T\t<id>\t<wav_path>\n                (client -> worker)
+         *   Q\n                                  (client -> worker)
+         *
+         * stdout responses:
+         *   R\t<id>\tOK\t<text>\n
+         *   R\t<id>\tERR\t<message>\n
+         */
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        setvbuf(stderr, NULL, _IOLBF, 0);
+        fputs("READY\n", stdout);
+        fflush(stdout);
+
+        char *line = NULL;
+        size_t cap = 0;
+        while (1) {
+            ssize_t n = getline(&line, &cap, stdin);
+            if (n < 0)
+                break;
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                line[--n] = '\0';
+            if (n == 0)
+                continue;
+            if (strcmp(line, "Q") == 0 || strcmp(line, "QUIT") == 0)
+                break;
+
+            if (line[0] != 'T') {
+                continue;
+            }
+
+            /* Parse tab-delimited: T \t id \t path */
+            char *saveptr = NULL;
+            char *tok = strtok_r(line, "\t", &saveptr);
+            if (!tok || strcmp(tok, "T") != 0) {
+                continue;
+            }
+            char *id_s = strtok_r(NULL, "\t", &saveptr);
+            char *path = strtok_r(NULL, "\t", &saveptr);
+            long id = id_s ? strtol(id_s, NULL, 10) : -1;
+            if (!path || path[0] == '\0') {
+                fprintf(stdout, "R\t%ld\tERR\tmissing path\n", id);
+                fflush(stdout);
+                continue;
+            }
+
+            char *text = vox_transcribe(ctx, path);
+            if (!text) {
+                fprintf(stdout, "R\t%ld\tERR\ttranscription failed\n", id);
+                fflush(stdout);
+                continue;
+            }
+            sanitize_single_line(text);
+            fprintf(stdout, "R\t%ld\tOK\t%s\n", id, text);
+            fflush(stdout);
+            free(text);
+        }
+        free(line);
+    } else if (use_mic) {
         /* Microphone capture with silence cancellation */
         if (vox_mic_start() != 0) {
             vox_stream_free(s);
@@ -414,14 +491,15 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    if (!use_mic) {
+    if (!use_mic && !use_worker) {
         double run_ms = vox_get_time_ms() - t0_run_ms;
         if (force_timing) {
             fprintf(stderr, "Wall transcribe: %.0f ms\n", run_ms);
         }
     }
 
-    vox_stream_free(s);
+    if (s)
+        vox_stream_free(s);
     vox_free(ctx);
 #ifdef USE_METAL
     vox_metal_shutdown();
