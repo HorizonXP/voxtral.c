@@ -25,24 +25,24 @@ async def _run(url: str, file_path: str, api_key: Optional[str]) -> int:
     form = aiohttp.FormData()
     form.add_field("model", "voxtral")
     form.add_field("response_format", "json")
-    form.add_field(
-        "file",
-        open(file_path, "rb"),
-        filename=os.path.basename(file_path),
-        content_type="application/octet-stream",
-    )
-
     async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.post(url, data=form) as resp:
-            body = await resp.text()
-            if resp.status != 200:
-                print(body, end="")
-                return 1
-            try:
-                obj = json.loads(body)
-                print(obj.get("text", "").strip())
-            except Exception:
-                print(body, end="")
+        with open(file_path, "rb") as f:
+            form.add_field(
+                "file",
+                f,
+                filename=os.path.basename(file_path),
+                content_type="application/octet-stream",
+            )
+            async with session.post(url, data=form) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    print(body, end="")
+                    return 1
+                try:
+                    obj = json.loads(body)
+                    print(obj.get("text", "").strip())
+                except Exception:
+                    print(body, end="")
     return 0
 
 
@@ -65,4 +65,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

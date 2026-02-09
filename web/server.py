@@ -186,8 +186,8 @@ async def handle_transcriptions(request: web.Request) -> web.StreamResponse:
         async for part in reader:
             if part.name == "file":
                 # Stream upload to disk.
-                fn = part.filename or "audio"
-                uploaded_path = str(td_path / fn)
+                # Do not trust the client-provided filename (path traversal / overwrite).
+                uploaded_path = str(td_path / "upload.bin")
                 with open(uploaded_path, "wb") as f:
                     while True:
                         chunk = await part.read_chunk()
