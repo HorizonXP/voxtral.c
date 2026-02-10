@@ -38,6 +38,17 @@ establish a target.
 
 Script: `scripts/benchmark_local_vs_mistral.sh`
 
+## Recent Findings (RTX 3080 Ti / WSL2)
+
+- CUDA encoder attention (MHA): skipping the KV-head expansion when `n_heads==n_kv_heads` reduces kernel work and helps long-clip throughput a few percent.
+- `VOX_STREAM_CHUNK_NEW_MEL` affects throughput on long clips (trade-off: chunk size vs overlap re-encode cost vs O(seq^2) attention work). On this machine, `1536` was best among a quick sweep for `samples/I_have_a_dream.ogg`:
+- `chunk_new_mel=512`: `infer_ms≈31766`, `xRT≈5.67`
+- `chunk_new_mel=1024`: `infer_ms≈30773`, `xRT≈5.85`
+- `chunk_new_mel=1536`: `infer_ms≈30412`, `xRT≈5.92`
+- `chunk_new_mel=2000`: `infer_ms≈31906`, `xRT≈5.64`
+- `VOX_CUDA_DIRECT_ATTN=1` (direct sliding-window attention kernel) was slower than the cuBLAS GEMM path for these clips on this GPU.
+- Cold vs hot: the first request after worker start can still be slower due to one-time autotune/graph-capture; `--batch-warmup` reduces (but may not eliminate) this.
+
 ## Next Performance Workstreams
 
 Ordered roughly by "likely to improve perceived latency" first, then throughput.
@@ -76,4 +87,3 @@ For each change:
    - (optional) hosted API wall time for both clips
 2. Ensure transcripts still look correct (spot check) and regressions are caught.
 3. Keep changes gated and documented (env flags / CLI flags).
-
