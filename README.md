@@ -414,6 +414,7 @@ Notes:
 - `VOX_CUDA_ATTN_V5=1` enables an experimental decoder attention variant that skips inactive chunks (best-effort; default off until validated broadly).
 - `VOX_CUDA_FAST=1` also enables cuBLASLt autotune for the `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`.
 - `VOX_CUDA_FAST=1` also enables a cuBLASLt “transpose-B view” for `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1` (or force it with `VOX_CUDA_CUBLASLT_TRANSPOSE_B=0/1`).
+- `VOX_CUDA_CUBLASLT_MAX_WS_MB=auto|<MB>` controls the *max* cuBLASLt workspace allowed for heuristic selection (can unlock faster `M=1` kernels at the cost of some persistent VRAM). Default is modest; `VOX_CUDA_FAST=1` biases it higher automatically.
 - `VOX_CUDA_LT_COMPUTE=32F_FAST_16BF` (or similar) opts into alternate cuBLASLt compute modes for BF16 GEMMs (default: `32F`). This may change outputs slightly; use `./scripts/accuracy_regression.sh` to validate.
 
 To run the extra CUDA benchmark variants (graphs/v3/merged/etc):

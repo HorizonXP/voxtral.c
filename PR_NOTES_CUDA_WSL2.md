@@ -16,6 +16,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - cuBLAS + (optional) cuBLASLt for small `M=1` GEMMs
   - Optional cuBLASLt autotune for `M=1` decoder GEMMs (enabled by `VOX_CUDA_FAST=1`; disable with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`)
   - Optional cuBLASLt transpose-B view for `M=1` decoder GEMMs (enabled by `VOX_CUDA_FAST=1`; disable with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1`)
+  - Optional cuBLASLt heuristic workspace cap: `VOX_CUDA_CUBLASLT_MAX_WS_MB=auto|<MB>` (higher can unlock faster `M=1` kernels at the cost of some persistent VRAM)
   - Optional cuBLASLt computeType override for BF16 GEMMs: `VOX_CUDA_LT_COMPUTE=32F_FAST_16BF|32F_FAST_TF32|32F_FAST_16F` (default: `32F`)
 - Custom CUDA kernels:
   - Built via `nvcc -cubin` and embedded as a C header (no PTX JIT at runtime).
