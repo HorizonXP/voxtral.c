@@ -94,6 +94,13 @@ static int *g_host_best = NULL;
 static int *g_host_dec_pos = NULL;
 static int *g_host_dec_logical_pos = NULL;
 static float *g_host_dec_x = NULL;
+static int *g_host_dec_prev_token = NULL;
+static int *g_host_dec_adapter_slot = NULL;
+
+/* Streaming pipeline per-step scalars used by the decoder CUDA Graph
+ * (set by vox_cuda_decoder_forward_from_stream_adapter). */
+static int g_stream_step_prev_token = 0;
+static int g_stream_step_adapter_slot = 0;
 
 /* Optional: use CUDA async allocation/mempool APIs to reduce per-weight alloc/free
  * overhead and avoid device-wide syncs during eviction. */
@@ -147,6 +154,7 @@ static CUfunction g_fn_apply_rope = 0;
 /* Optional: generate RoPE freqs on-device for CUDA Graphs (best-effort). */
 static CUfunction g_fn_rope_freqs_1pos = 0;
 static CUfunction g_fn_step_embed_from_adapter = 0;
+static CUfunction g_fn_step_embed_from_adapter_dyn = 0;
 static CUfunction g_fn_downsample4 = 0;
 static CUfunction g_fn_argmax = 0;
 static CUfunction g_fn_logits_best_init_u64 = 0;
@@ -972,13 +980,18 @@ static CUgraphExec g_dec_graph_exec = 0;
 static int g_dec_graph_ready = 0;
 static CUdeviceptr g_dec_pos_dev = 0; /* device-side scalar int */
 static CUdeviceptr g_dec_logical_pos_dev = 0; /* device-side scalar int (for RoPE) */
+static CUdeviceptr g_dec_prev_token_dev = 0; /* device-side scalar int (pipeline step-embed) */
+static CUdeviceptr g_dec_adapter_slot_dev = 0; /* device-side scalar int (pipeline step-embed) */
 static CUdeviceptr g_dec_rope_inv_freq = 0; /* [head_dim/2] f32 inv-freq table */
 static int g_dec_graph_kv_fp16 = -1;
 static int g_dec_graph_input_on_device = -1;
 static int g_dec_graph_use_host_x = 0;
 static int g_dec_graph_use_host_pos = 0;
 static int g_dec_graph_use_host_logical_pos = 0;
+static int g_dec_graph_use_host_prev_token = 0;
+static int g_dec_graph_use_host_adapter_slot = 0;
 static int g_dec_graph_use_best_dtoh = 0;
+static int g_dec_graph_use_step_embed_from_adapter = 0;
 /* 0=matmul+argmax, 1=bf16_fused_top1, 2=int8_fused_top1 */
 static int g_dec_graph_logits_mode = 0;
 
@@ -997,8 +1010,15 @@ static int pipeline_full_enabled(void) {
     if (cached != -1) return cached;
     const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
     if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    /* Explicit override. */
     const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
-    cached = (env && env[0] && env[0] != '0');
+    if (env) {
+        cached = (env[0] && env[0] != '0');
+        return cached;
+    }
+
+    /* Default on under VOX_CUDA_FAST (best-effort). */
+    cached = cuda_fast_enabled();
     return cached;
 }
 
@@ -1641,6 +1661,8 @@ static int cuda_load_kernel_module(void) {
         if (g_mod) {
             if (!g_fn_step_embed_from_adapter)
                 (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter, g_mod, "vox_step_embed_from_adapter_f32");
+            if (!g_fn_step_embed_from_adapter_dyn)
+                (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter_dyn, g_mod, "vox_step_embed_from_adapter_dyn_f32");
         }
         /* Optional fused logits (top1-only) kernels (best-effort). */
         if (g_mod) {
@@ -1717,6 +1739,7 @@ static int cuda_load_kernel_module(void) {
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_apply_rope_f32)", r); return 0; }
     (void)cuModuleGetFunction(&g_fn_rope_freqs_1pos, g_mod, "vox_rope_freqs_1pos_f32");
     (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter, g_mod, "vox_step_embed_from_adapter_f32");
+    (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter_dyn, g_mod, "vox_step_embed_from_adapter_dyn_f32");
     r = cuModuleGetFunction(&g_fn_downsample4, g_mod, "vox_downsample4_concat_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_downsample4_concat_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_argmax, g_mod, "vox_argmax_f32");
@@ -3162,6 +3185,18 @@ static void vox_cuda_init(void) {
             g_host_dec_x = (float *)tmp;
         }
     }
+    if (!g_host_dec_prev_token) {
+        void *tmp = NULL;
+        if (cuMemAllocHost(&tmp, sizeof(int)) == CUDA_SUCCESS) {
+            g_host_dec_prev_token = (int *)tmp;
+        }
+    }
+    if (!g_host_dec_adapter_slot) {
+        void *tmp = NULL;
+        if (cuMemAllocHost(&tmp, sizeof(int)) == CUDA_SUCCESS) {
+            g_host_dec_adapter_slot = (int *)tmp;
+        }
+    }
 
     g_available = 1;
 out:
@@ -3391,10 +3426,15 @@ void vox_cuda_shutdown(void) {
     g_dec_graph_use_host_x = 0;
     g_dec_graph_use_host_pos = 0;
     g_dec_graph_use_host_logical_pos = 0;
+    g_dec_graph_use_host_prev_token = 0;
+    g_dec_graph_use_host_adapter_slot = 0;
     g_dec_graph_use_best_dtoh = 0;
+    g_dec_graph_use_step_embed_from_adapter = 0;
     g_dec_graph_logits_mode = 0;
     shutdown_dev_free_ptr(&g_dec_pos_dev);
     shutdown_dev_free_ptr(&g_dec_logical_pos_dev);
+    shutdown_dev_free_ptr(&g_dec_prev_token_dev);
+    shutdown_dev_free_ptr(&g_dec_adapter_slot_dev);
     shutdown_dev_free_ptr(&g_dec_rope_inv_freq);
 
     if (g_host_best) {
@@ -3412,6 +3452,14 @@ void vox_cuda_shutdown(void) {
     if (g_host_dec_x) {
         (void)cuMemFreeHost(g_host_dec_x);
         g_host_dec_x = NULL;
+    }
+    if (g_host_dec_prev_token) {
+        (void)cuMemFreeHost(g_host_dec_prev_token);
+        g_host_dec_prev_token = NULL;
+    }
+    if (g_host_dec_adapter_slot) {
+        (void)cuMemFreeHost(g_host_dec_adapter_slot);
+        g_host_dec_adapter_slot = NULL;
     }
 
     shutdown_dev_free_ptr(&g_dA);
@@ -3656,6 +3704,7 @@ void vox_cuda_shutdown(void) {
     g_fn_apply_rope = 0;
     g_fn_rope_freqs_1pos = 0;
     g_fn_step_embed_from_adapter = 0;
+    g_fn_step_embed_from_adapter_dyn = 0;
     g_fn_downsample4 = 0;
     g_fn_argmax = 0;
     g_fn_logits_best_init_u64 = 0;
@@ -5038,7 +5087,10 @@ static void decoder_graph_destroy(void) {
     g_dec_graph_use_host_x = 0;
     g_dec_graph_use_host_pos = 0;
     g_dec_graph_use_host_logical_pos = 0;
+    g_dec_graph_use_host_prev_token = 0;
+    g_dec_graph_use_host_adapter_slot = 0;
     g_dec_graph_use_best_dtoh = 0;
+    g_dec_graph_use_step_embed_from_adapter = 0;
     g_dec_graph_logits_mode = 0;
 
     if (g_dec_pos_dev) cuMemFree(g_dec_pos_dev);
@@ -5046,6 +5098,12 @@ static void decoder_graph_destroy(void) {
 
     if (g_dec_logical_pos_dev) cuMemFree(g_dec_logical_pos_dev);
     g_dec_logical_pos_dev = 0;
+
+    if (g_dec_prev_token_dev) cuMemFree(g_dec_prev_token_dev);
+    g_dec_prev_token_dev = 0;
+
+    if (g_dec_adapter_slot_dev) cuMemFree(g_dec_adapter_slot_dev);
+    g_dec_adapter_slot_dev = 0;
 }
 
 static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
@@ -5116,6 +5174,12 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
     }
     if (use_rope_dev && !g_dec_logical_pos_dev) {
         if (cuMemAlloc(&g_dec_logical_pos_dev, sizeof(int)) != CUDA_SUCCESS) return 0;
+    }
+    if (!g_dec_prev_token_dev) {
+        if (cuMemAlloc(&g_dec_prev_token_dev, sizeof(int)) != CUDA_SUCCESS) return 0;
+    }
+    if (!g_dec_adapter_slot_dev) {
+        if (cuMemAlloc(&g_dec_adapter_slot_dev, sizeof(int)) != CUDA_SUCCESS) return 0;
     }
     if (use_rope_dev && !g_dec_rope_inv_freq) {
         /* Precompute inv_freq[d] = 1 / pow(theta, 2d/head_dim) and upload. */
@@ -5402,7 +5466,10 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     if (!d_norm) return 0;
     size_t bytes_tok = (size_t)VOX_VOCAB_SIZE * (size_t)dim * sizeof(uint16_t);
     CUdeviceptr dTok = 0;
-    if (logits_mode != 2) {
+    /* Even when logits are INT8-fused, the streaming pipeline step-embed uses
+     * BF16 token embeddings on device. */
+    int need_tok_bf16 = (logits_mode != 2) || input_on_device;
+    if (need_tok_bf16) {
         dTok = bf16_cache_get(dec->tok_embeddings_bf16, bytes_tok);
         if (!dTok) return 0;
     }
@@ -5411,7 +5478,17 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     int use_host_x = (!input_on_device && g_host_dec_x);
     int use_host_pos = (g_host_dec_pos != NULL);
     int use_host_logical_pos = (use_rope_dev && g_host_dec_logical_pos != NULL);
+    int use_host_prev_token = (g_host_dec_prev_token != NULL);
+    int use_host_adapter_slot = (g_host_dec_adapter_slot != NULL);
     int use_best_dtoh = (g_host_best != NULL);
+    int use_step_embed_from_adapter = (input_on_device &&
+                                       pipeline_full_enabled() &&
+                                       g_fn_step_embed_from_adapter_dyn &&
+                                       g_stream_adapter &&
+                                       g_stream_adapter_cap_tokens > 0 &&
+                                       g_dec_prev_token_dev &&
+                                       g_dec_adapter_slot_dev &&
+                                       dTok);
 
     /* Stream capture executes the launched work; ensure captured inputs have a
      * defined value during capture. Use the current ctx position so we don't
@@ -5433,6 +5510,22 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
             if (cuMemcpyHtoDAsync(g_dec_logical_pos_dev, &cap_logical_pos, sizeof(cap_logical_pos), g_stream) != CUDA_SUCCESS) return 0;
         }
     }
+    if (use_step_embed_from_adapter) {
+        int cap_prev_token = g_stream_step_prev_token;
+        int cap_slot = g_stream_step_adapter_slot;
+        if (cap_prev_token < 0) cap_prev_token = 1;
+        if (cap_slot < 0) cap_slot = 0;
+        if (use_host_prev_token) {
+            *g_host_dec_prev_token = cap_prev_token;
+        } else {
+            if (cuMemcpyHtoDAsync(g_dec_prev_token_dev, &cap_prev_token, sizeof(cap_prev_token), g_stream) != CUDA_SUCCESS) return 0;
+        }
+        if (use_host_adapter_slot) {
+            *g_host_dec_adapter_slot = cap_slot;
+        } else {
+            if (cuMemcpyHtoDAsync(g_dec_adapter_slot_dev, &cap_slot, sizeof(cap_slot), g_stream) != CUDA_SUCCESS) return 0;
+        }
+    }
 
     CUresult rr;
     rr = cuStreamBeginCapture(g_stream, CU_STREAM_CAPTURE_MODE_GLOBAL);
@@ -5451,6 +5544,14 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     if (use_host_logical_pos) {
         rr = cuMemcpyHtoDAsync(g_dec_logical_pos_dev, g_host_dec_logical_pos, sizeof(int), g_stream);
         if (rr != CUDA_SUCCESS) { log_cu_error("HtoD(dec_logical_pos_graph_cap)", rr); goto capture_fail; }
+    }
+    if (use_step_embed_from_adapter && use_host_prev_token) {
+        rr = cuMemcpyHtoDAsync(g_dec_prev_token_dev, g_host_dec_prev_token, sizeof(int), g_stream);
+        if (rr != CUDA_SUCCESS) { log_cu_error("HtoD(dec_prev_token_graph_cap)", rr); goto capture_fail; }
+    }
+    if (use_step_embed_from_adapter && use_host_adapter_slot) {
+        rr = cuMemcpyHtoDAsync(g_dec_adapter_slot_dev, g_host_dec_adapter_slot, sizeof(int), g_stream);
+        if (rr != CUDA_SUCCESS) { log_cu_error("HtoD(dec_adapter_slot_graph_cap)", rr); goto capture_fail; }
     }
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
@@ -5480,6 +5581,17 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
                             rope_threads, 1, 1,
                             0, g_stream, rope_params, NULL);
         if (rr != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(rope_freqs_1pos)", rr); goto capture_fail; }
+    }
+
+    if (use_step_embed_from_adapter) {
+        int se_threads = 256;
+        int se_blocks = (dim + se_threads - 1) / se_threads;
+        void *se_params[] = { &g_dec_x, &g_stream_adapter, &dTok, &g_dec_prev_token_dev, &g_dec_adapter_slot_dev, &dim };
+        rr = cuLaunchKernel(g_fn_step_embed_from_adapter_dyn,
+                            se_blocks, 1, 1,
+                            se_threads, 1, 1,
+                            0, g_stream, se_params, NULL);
+        if (rr != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(step_embed_from_adapter_dyn)", rr); goto capture_fail; }
     }
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
@@ -5679,7 +5791,10 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     g_dec_graph_use_host_x = use_host_x;
     g_dec_graph_use_host_pos = use_host_pos;
     g_dec_graph_use_host_logical_pos = use_host_logical_pos;
+    g_dec_graph_use_host_prev_token = use_host_prev_token;
+    g_dec_graph_use_host_adapter_slot = use_host_adapter_slot;
     g_dec_graph_use_best_dtoh = use_best_dtoh;
+    g_dec_graph_use_step_embed_from_adapter = use_step_embed_from_adapter;
     g_dec_graph_logits_mode = logits_mode;
     if (vox_verbose >= 1) {
         int have_v2 = want_fp16 ? (g_fn_attn_dyn_fp16_v2 != 0) : (g_fn_attn_dyn_f32_v2 != 0);
@@ -5688,7 +5803,7 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         else if (use_v3) attn = "v3";
         else if (use_v2 && have_v2) attn = "v2";
         const char *logits_s = (logits_mode == 2) ? "int8_fused" : (logits_mode == 1) ? "bf16_fused" : "matmul";
-        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s, logits=%s)\n",
+        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s, logits=%s)\n",
                 want_fp16 ? "fp16" : "fp32",
                 attn,
                 use_merge_qkv ? ", merge_qkv" : "",
@@ -5697,6 +5812,7 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
                 use_host_x ? ", host_x" : "",
                 use_host_pos ? ", host_pos" : "",
                 use_host_logical_pos ? ", host_logical_pos" : "",
+                use_step_embed_from_adapter ? ", step_embed_adapter" : "",
                 use_best_dtoh ? ", best_dtoh" : "",
                 logits_s);
     }
@@ -5790,6 +5906,25 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     } else {
         r = cuMemcpyHtoDAsync(g_dec_pos_dev, &pos, sizeof(pos), g_stream);
         if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_pos_graph)", r); return 0; }
+    }
+
+    if (input_on_device && g_dec_graph_use_step_embed_from_adapter) {
+        int tok = g_stream_step_prev_token;
+        int slot = g_stream_step_adapter_slot;
+
+        if (g_dec_graph_use_host_prev_token && g_host_dec_prev_token) {
+            *g_host_dec_prev_token = tok;
+        } else {
+            r = cuMemcpyHtoDAsync(g_dec_prev_token_dev, &tok, sizeof(tok), g_stream);
+            if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_prev_token_graph)", r); return 0; }
+        }
+
+        if (g_dec_graph_use_host_adapter_slot && g_host_dec_adapter_slot) {
+            *g_host_dec_adapter_slot = slot;
+        } else {
+            r = cuMemcpyHtoDAsync(g_dec_adapter_slot_dev, &slot, sizeof(slot), g_stream);
+            if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_adapter_slot_graph)", r); return 0; }
+        }
     }
 
     r = cuGraphLaunch(g_dec_graph_exec, g_stream);
@@ -6146,7 +6281,17 @@ int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
     CUdeviceptr dTok = bf16_cache_get(ctx->decoder.tok_embeddings_bf16, bytes_emb);
     if (!dTok) goto out;
 
-    if (!launch_step_embed_from_adapter(g_dec_x, g_stream_adapter, dTok, prev_token, slot, dim)) goto out;
+    g_stream_step_prev_token = prev_token;
+    g_stream_step_adapter_slot = slot;
+
+    /* If the decoder CUDA graph is active and includes the adapter step-embed
+     * kernel, avoid launching the separate step-embed kernel here. */
+    int graph_embed = (g_dec_graph_ready &&
+                       g_dec_graph_input_on_device == 1 &&
+                       g_dec_graph_use_step_embed_from_adapter);
+    if (!graph_embed) {
+        if (!launch_step_embed_from_adapter(g_dec_x, g_stream_adapter, dTok, prev_token, slot, dim)) goto out;
+    }
 
     ok = vox_cuda_decoder_forward_full_impl(out_token, logits_or_null, ctx, NULL, 1);
     cuda_ctx_state_save_bound();

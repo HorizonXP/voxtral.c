@@ -770,7 +770,12 @@ static void stream_adapter_compact(vox_stream_t *s) {
 }
 
 /* Optional: keep adapter embeddings on device and let CUDA build the decoder step
- * embeddings directly from the adapter buffer (opt-in via VOX_CUDA_PIPELINE_FULL=1). */
+ * embeddings directly from the adapter buffer (opt-in via VOX_CUDA_PIPELINE_FULL=1).
+ *
+ * Default on under VOX_CUDA_FAST=1 (best-effort). Disable with:
+ * - VOX_DISABLE_CUDA_PIPELINE_FULL=1, or
+ * - VOX_CUDA_PIPELINE_FULL=0
+ */
 static int stream_use_cuda_pipeline_full(void) {
 #ifdef USE_CUDA
     static int cached = -1;
@@ -782,14 +787,26 @@ static int stream_use_cuda_pipeline_full(void) {
         return cached;
     }
 
+    /* Explicit override. */
     const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
-    if (!env || !env[0] || env[0] == '0') {
-        cached = 0;
+    if (env) {
+        if (!env[0] || env[0] == '0') {
+            cached = 0;
+            return cached;
+        }
+        /* Requires the full CUDA encoder path since we rely on device-side adapter output. */
+        cached = stream_use_cuda_encoder_full();
         return cached;
     }
 
-    /* Requires the full CUDA encoder path since we rely on device-side adapter output. */
-    cached = stream_use_cuda_encoder_full();
+    /* Default on under VOX_CUDA_FAST (best-effort). */
+    const char *fast = getenv("VOX_CUDA_FAST");
+    if (fast && fast[0] && fast[0] != '0') {
+        cached = stream_use_cuda_encoder_full();
+        return cached;
+    }
+
+    cached = 0;
     return cached;
 #else
     return 0;
