@@ -13,13 +13,24 @@ set -euo pipefail
 #   LOCAL_URL=http://127.0.0.1:8000
 #   LOCAL_API_KEY=...                 (if VOXTRAL_API_KEY is enabled on the server)
 #   MISTRAL_URL=https://api.mistral.ai/v1/audio/transcriptions
-#   MISTRAL_MODEL=voxtral-2
+#   MISTRAL_MODEL=auto                (picks the closest Voxtral model available)
+#
+# Notes:
+# - This repo currently runs the open-weight Voxtral Realtime model:
+#     mistralai/Voxtral-Mini-4B-Realtime-2602
+#   so the default `MISTRAL_MODEL=auto` tries to pick `voxtral-mini-2602` for a
+#   closer apples-to-apples comparison (vs `voxtral-mini-latest`, which may map
+#   to a different hosted model/serving stack).
 
 LOCAL_URL="${LOCAL_URL:-http://127.0.0.1:8000}"
 LOCAL_API_KEY="${LOCAL_API_KEY:-}"
 
 MISTRAL_URL="${MISTRAL_URL:-https://api.mistral.ai/v1/audio/transcriptions}"
-MISTRAL_MODEL="${MISTRAL_MODEL:-voxtral-2}"
+MISTRAL_MODELS_URL="${MISTRAL_MODELS_URL:-https://api.mistral.ai/v1/models}"
+MISTRAL_MODEL="${MISTRAL_MODEL:-auto}"
+MISTRAL_MODEL_RESOLVED=""
+
+LOCAL_MODEL_LABEL="${LOCAL_MODEL_LABEL:-mistralai/Voxtral-Mini-4B-Realtime-2602}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -69,12 +80,76 @@ else:
 PY
 }
 
+mistral_auto_model() {
+  python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+key = os.environ.get("MISTRAL_API_KEY", "")
+url = os.environ.get("MISTRAL_MODELS_URL", "https://api.mistral.ai/v1/models")
+local_label = os.environ.get("LOCAL_MODEL_LABEL", "").lower()
+
+if not key:
+    print("")
+    raise SystemExit(0)
+
+try:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        obj = json.loads(resp.read())
+except Exception:
+    # If we can't list models, fall back to a reasonable default.
+    print("voxtral-mini-2602" if "2602" in local_label else "voxtral-mini-latest")
+    raise SystemExit(0)
+
+ids = []
+seen = set()
+for item in obj.get("data", []) or []:
+    if not isinstance(item, dict):
+        continue
+    mid = item.get("id")
+    if not isinstance(mid, str):
+        continue
+    if mid in seen:
+        continue
+    seen.add(mid)
+    ids.append(mid)
+
+def pick_first(candidates):
+    for c in candidates:
+        if c in seen:
+            return c
+    return None
+
+preferred = []
+if "2602" in local_label:
+    preferred += ["voxtral-mini-2602"]
+if "2507" in local_label:
+    preferred += ["voxtral-mini-2507"]
+preferred += ["voxtral-mini-2602", "voxtral-mini-2507", "voxtral-mini-latest"]
+
+chosen = pick_first(preferred)
+if not chosen:
+    # last-resort: any voxtral* model
+    for mid in ids:
+        if "voxtral" in mid.lower():
+            chosen = mid
+            break
+
+print(chosen or "")
+PY
+}
+
 local_health_check() {
   local health
   health="$(curl -sS --max-time 2 "${LOCAL_URL}/health" || true)"
   if [[ -z "${health}" ]]; then
     echo "[error] local server not reachable at ${LOCAL_URL}" >&2
-    echo "Start it from repo root: env VOX_CUDA_FAST=1 python3 web/server.py" >&2
+    echo "Start it from repo root:" >&2
+    echo "  env VOX_CUDA_FAST=1 python3 web/server.py" >&2
+    echo "  env VOX_CUDA_FAST=1 web/.venv/bin/python web/server.py   # if using the web venv" >&2
     exit 1
   fi
   python3 - <<PY
@@ -155,7 +230,7 @@ PY
     note="missing_x_voxtral_headers(restart_server?)"
   fi
 
-  echo -e "local\t${file}\t${audio_s}\t${http_code}\t${upload_ms}\t${decode_ms}\t${infer_ms}\t${total_ms}\t${xrt_infer}\t${wall_ms}\t${xrt_wall}\t${text_chars}\t${note}"
+  echo -e "local\t${LOCAL_MODEL_LABEL}\t${file}\t${audio_s}\t${http_code}\t${upload_ms}\t${decode_ms}\t${infer_ms}\t${total_ms}\t${xrt_infer}\t${wall_ms}\t${xrt_wall}\t${text_chars}\t${note}"
 
   rm -f "${hdr}" "${body}"
 }
@@ -166,8 +241,21 @@ bench_mistral_one() {
   dur="$(duration_sec "${file}")"
 
   if [[ -z "${MISTRAL_API_KEY:-}" ]]; then
-    echo -e "mistral\t${file}\t${dur}\t\t\t\t\t\t\t\t\t\tSKIP(no MISTRAL_API_KEY)"
+    echo -e "mistral\t${MISTRAL_MODEL}\t${file}\t${dur}\t\t\t\t\t\t\t\t\t\tSKIP(no MISTRAL_API_KEY)"
     return 0
+  fi
+
+  local model="${MISTRAL_MODEL}"
+  if [[ "${model}" == "auto" ]]; then
+    if [[ -n "${MISTRAL_MODEL_RESOLVED}" ]]; then
+      model="${MISTRAL_MODEL_RESOLVED}"
+    else
+      model="$(mistral_auto_model)"
+      if [[ -z "${model}" ]]; then
+        model="voxtral-mini-latest"
+      fi
+      MISTRAL_MODEL_RESOLVED="${model}"
+    fi
   fi
 
   local hdr body
@@ -182,7 +270,7 @@ bench_mistral_one() {
       -w '%{time_total}\t%{http_code}' \
       -H "Authorization: Bearer ${MISTRAL_API_KEY}" \
       -F "file=@${file}" \
-      -F "model=${MISTRAL_MODEL}" \
+      -F "model=${model}" \
       -F "response_format=json" \
       "${MISTRAL_URL}"
   )"
@@ -215,7 +303,7 @@ PY
     note="no_text_field_or_invalid_json"
   fi
 
-  echo -e "mistral\t${file}\t${dur}\t${http_code}\t\t\t\t\t\t${wall_ms}\t${xrt_wall}\t${text_chars}\t${note}"
+  echo -e "mistral\t${model}\t${file}\t${dur}\t${http_code}\t\t\t\t\t\t${wall_ms}\t${xrt_wall}\t${text_chars}\t${note}"
 
   rm -f "${hdr}" "${body}"
 }
@@ -230,7 +318,7 @@ main() {
 
   local_health_check
 
-  echo -e "backend\tfile\taudio_s\thttp_code\tupload_ms\tdecode_ms\tinfer_ms\ttotal_ms\txRT_infer\twall_ms\txRT_wall\ttext_chars\tnote"
+  echo -e "backend\tmodel\tfile\taudio_s\thttp_code\tupload_ms\tdecode_ms\tinfer_ms\ttotal_ms\txRT_infer\twall_ms\txRT_wall\ttext_chars\tnote"
   for f in "${files[@]}"; do
     bench_local_one "${f}"
   done
@@ -242,4 +330,3 @@ main() {
 }
 
 main "$@"
-
