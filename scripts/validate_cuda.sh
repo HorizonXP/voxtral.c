@@ -24,6 +24,10 @@ printf "[ok] CUDA smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_smoke.tx
 VOX_CUDA_FAST=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_smoke.txt
 printf "[ok] CUDA fast smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_smoke.txt)"
 
+# Fast with attention v5 disabled (should still run; falls back to v4/v3).
+VOX_CUDA_FAST=1 VOX_DISABLE_CUDA_ATTN_V5=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_noattn5_smoke.txt
+printf "[ok] CUDA fast (no attn v5) smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_noattn5_smoke.txt)"
+
 # Fast without the full CUDA streaming pipeline (baseline comparison / fallback).
 VOX_CUDA_FAST=1 VOX_CUDA_PIPELINE_FULL=0 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_nopipe_smoke.txt
 printf "[ok] CUDA fast (no pipeline) smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_nopipe_smoke.txt)"
