@@ -44,7 +44,16 @@ CUDA_CUBIN_HDR = voxtral_cuda_kernels_cubin.h
 # Note: the embedded CUBIN is arch-specific. Override as needed, e.g.:
 #   make cuda CUDA_ARCH=sm_80   # A100
 #   make cuda CUDA_ARCH=sm_89   # RTX 4090
-CUDA_ARCH ?= sm_86
+#   make cuda CUDA_ARCH=sm_120  # RTX 5090
+CUDA_ARCH_DETECTED := $(shell \
+	if command -v nvidia-smi >/dev/null 2>&1; then \
+		cc=$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]'); \
+		if [ -n "$$cc" ]; then \
+			printf 'sm_%s\n' "$$(printf '%s' "$$cc" | tr -d '.')"; \
+		fi; \
+	fi \
+)
+CUDA_ARCH ?= $(if $(CUDA_ARCH_DETECTED),$(CUDA_ARCH_DETECTED),sm_86)
 
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
@@ -94,6 +103,7 @@ blas:
 # Backend: cuda (NVIDIA CUDA + cuBLAS)
 # =============================================================================
 CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I$(CUDA_HOME)/include -DVOX_CUDA_ARCH=$(CUDA_ARCH)
+CUDA_NVCCFLAGS = -O3 --std=c++14 -U_GNU_SOURCE -cubin -arch=$(CUDA_ARCH) -lineinfo
 # Prefer toolkit libs, but allow linking libcuda via toolkit stubs in non-driver CI.
 CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcublasLt -lcublas -lcuda
 
@@ -219,7 +229,7 @@ inspect_weights.o: inspect_weights.c voxtral_safetensors.h
 # CUDA kernels: compile .cu -> CUBIN -> embed as C header
 # =============================================================================
 $(CUDA_CUBIN): voxtral_cuda_kernels.cu
-	$(CUDA_HOME)/bin/nvcc -O3 --std=c++14 -cubin -arch=$(CUDA_ARCH) -lineinfo -o $@ $<
+	$(CUDA_HOME)/bin/nvcc $(CUDA_NVCCFLAGS) -o $@ $<
 
 $(CUDA_CUBIN_HDR): $(CUDA_CUBIN)
 	xxd -i $< > $@
