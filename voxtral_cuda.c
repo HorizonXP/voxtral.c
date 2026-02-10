@@ -313,10 +313,16 @@ static int attn_v3_disabled(void) {
 }
 
 static int cuda_fast_enabled(void) {
+    /* Default-on for this CUDA backend because long-stream decoder throughput
+     * regresses significantly without the fast-path stack (graphs/merged GEMMs/
+     * fused logits/attention upgrades). Keep explicit opt-out envs for safety. */
     static int cached = -1;
     if (cached != -1) return cached;
+    const char *disable = getenv("VOX_DISABLE_CUDA_FAST");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
     const char *env = getenv("VOX_CUDA_FAST");
-    cached = (env && env[0] && env[0] != '0');
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = 1;
     return cached;
 }
 
