@@ -36,6 +36,35 @@ make cuda >/dev/null
 echo "[4/4] run CUDA transcript"
 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent | normalize > /tmp/voxtral_ref_cuda.txt
 
+if [[ "${VOX_TEST_CUDA_DECODER_INT8:-0}" != "0" ]]; then
+  echo "[opt] run CUDA decoder INT8 transcript (VOX_CUDA_DECODER_INT8=1)"
+  VOX_CUDA_DECODER_INT8=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent | normalize > /tmp/voxtral_ref_cuda_dec_int8.txt
+  python3 - <<PY
+from pathlib import Path
+import difflib
+import os
+
+def norm_nospace(s: str) -> str:
+    # Decoder variants may change whitespace tokenization (e.g. leading-space tokens).
+    # Compare with whitespace removed for a more robust signal.
+    return "".join(s.lower().split())
+
+base = norm_nospace(Path('/tmp/voxtral_ref_cuda.txt').read_text())
+q8 = norm_nospace(Path('/tmp/voxtral_ref_cuda_dec_int8.txt').read_text())
+
+sm = difflib.SequenceMatcher(a=base, b=q8)
+ratio = 1.0 - sm.ratio()
+print(f"decoder_int8_char_mismatch_ratio_nospace={ratio:.6f}")
+print(f"base_chars={len(base)} decoder_int8_chars={len(q8)}")
+
+tol = float(os.environ.get("VOX_TEST_CUDA_DECODER_INT8_TOL", '${TOLERANCE_RATIO}'))
+print(f"decoder_int8_tolerance={tol:.6f}")
+if ratio > tol:
+    raise SystemExit(f"FAIL: decoder INT8 mismatch ratio {ratio:.6f} exceeds tolerance {tol:.6f}")
+print("PASS (decoder INT8)")
+PY
+fi
+
 if [[ "${VOX_TEST_CUDA_PIPELINE_FULL:-0}" != "0" ]]; then
   echo "[opt] run CUDA pipeline transcript (VOX_CUDA_PIPELINE_FULL=1)"
   VOX_CUDA_PIPELINE_FULL=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent | normalize > /tmp/voxtral_ref_cuda_pipeline.txt
