@@ -32,6 +32,8 @@
 /* Forward declarations for helpers referenced before their definition. */
 static void log_cu_error(const char *what, CUresult r);
 static int pipeline_full_enabled(void);
+static int eq_nocase(const char *a, const char *b);
+static int cuda_fast_enabled(void);
 
 /* voxtral.c global verbosity flag */
 extern int vox_verbose;
@@ -189,16 +191,42 @@ static size_t cublaslt_max_workspace_bytes(void) {
      * faster kernels at the cost of some persistent VRAM. */
     static size_t cached = (size_t)-1;
     if (cached != (size_t)-1) return cached;
-    long mb = 32; /* default */
     const char *env = getenv("VOX_CUDA_CUBLASLT_MAX_WS_MB");
+    long mb = -1;
     if (env && env[0]) {
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (end != env) mb = v;
+        if (eq_nocase(env, "auto")) {
+            mb = -1; /* compute below */
+        } else {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env) mb = v;
+        }
+    }
+
+    if (mb < 0) {
+        /* Default: modest cap. In VOX_CUDA_FAST mode, bias toward a larger cap
+         * to unlock better M=1 kernels on modern GPUs, while still keeping the
+         * persistent allocation bounded. */
+        mb = 32;
+        if (cuda_fast_enabled()) {
+            size_t total = 0;
+            if (cuDeviceTotalMem(&total, g_dev) == CUDA_SUCCESS && total > 0) {
+                /* Use a small fraction of total VRAM; clamp to a sane range. */
+                long dyn_mb = (long)(total / (64ULL * 1024ULL * 1024ULL));
+                if (dyn_mb < 32) dyn_mb = 32;
+                if (dyn_mb > 256) dyn_mb = 256;
+                mb = dyn_mb;
+            } else {
+                mb = 128;
+            }
+        }
     }
     if (mb < 0) mb = 0;
     if (mb > 2048) mb = 2048; /* clamp */
     cached = (size_t)mb * 1024ULL * 1024ULL;
+    if (vox_verbose >= 2) {
+        fprintf(stderr, "[cuda] cublasLt max workspace cap: %ld MiB (VOX_CUDA_CUBLASLT_MAX_WS_MB)\n", mb);
+    }
     return cached;
 }
 
@@ -2444,32 +2472,61 @@ static int lt_autotune_t_bf16(int M, int K, int N,
 
     if (e->tuned) return 1;
 
-    /* Query a handful of heuristic algos under the current workspace cap, then
-     * time them once and cache the fastest. */
+    /* Query a handful of heuristic algos and time them once to pick the fastest.
+     *
+     * Important: the heuristic ranking depends on the workspace cap. To reduce
+     * sensitivity, we query both:
+     *  - max_ws=0 (no-workspace kernels), and
+     *  - max_ws=cublaslt_max_workspace_bytes() (workspace-using kernels)
+     * and time the union of candidates. */
     int top = cublaslt_autotune_top();
-    cublasLtMatmulHeuristicResult_t heur[32];
-    int returned = 0;
-
-    cublasLtMatmulPreference_t pref = NULL;
+    typedef struct { cublasLtMatmulAlgo_t algo; size_t ws; } lt_cand_t;
+    lt_cand_t cands[64];
+    int n_cands = 0;
     cublasStatus_t st;
-    st = cublasLtMatmulPreferenceCreate(&pref);
-    if (st != CUBLAS_STATUS_SUCCESS) { e->tuned = 1; return 1; }
 
     size_t max_ws = cublaslt_max_workspace_bytes();
-    (void)cublasLtMatmulPreferenceSetAttribute(pref,
-                                               CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                               &max_ws, sizeof(max_ws));
+    size_t ws_caps[2] = { 0, max_ws };
+    int n_caps = (max_ws > 0) ? 2 : 1;
+    for (int cap_i = 0; cap_i < n_caps; cap_i++) {
+        cublasLtMatmulHeuristicResult_t heur[32];
+        int returned = 0;
 
-    st = cublasLtMatmulAlgoGetHeuristic(g_lt_handle,
-                                        e->op,
-                                        e->a, e->b,
-                                        e->c, e->c,
-                                        pref,
-                                        top, heur, &returned);
-    cublasLtMatmulPreferenceDestroy(pref);
-    pref = NULL;
+        cublasLtMatmulPreference_t pref = NULL;
+        st = cublasLtMatmulPreferenceCreate(&pref);
+        if (st != CUBLAS_STATUS_SUCCESS) continue;
 
-    if (st != CUBLAS_STATUS_SUCCESS || returned <= 0) { e->tuned = 1; return 1; }
+        size_t cap = ws_caps[cap_i];
+        (void)cublasLtMatmulPreferenceSetAttribute(pref,
+                                                   CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                   &cap, sizeof(cap));
+
+        st = cublasLtMatmulAlgoGetHeuristic(g_lt_handle,
+                                            e->op,
+                                            e->a, e->b,
+                                            e->c, e->c,
+                                            pref,
+                                            top, heur, &returned);
+        cublasLtMatmulPreferenceDestroy(pref);
+        pref = NULL;
+        if (st != CUBLAS_STATUS_SUCCESS || returned <= 0) continue;
+
+        for (int i = 0; i < returned; i++) {
+            int dup = 0;
+            for (int j = 0; j < n_cands; j++) {
+                if (memcmp(&cands[j].algo, &heur[i].algo, sizeof(cublasLtMatmulAlgo_t)) == 0) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (n_cands < (int)(sizeof(cands) / sizeof(cands[0]))) {
+                cands[n_cands++] = (lt_cand_t){ .algo = heur[i].algo, .ws = heur[i].workspaceSize };
+            }
+        }
+    }
+
+    if (n_cands <= 0) { e->tuned = 1; return 1; }
 
     /* Scratch output buffer: [M,N] f32. */
     size_t bytes_c = (size_t)M * (size_t)N * sizeof(float);
@@ -2496,8 +2553,8 @@ static int lt_autotune_t_bf16(int M, int K, int N,
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    for (int i = 0; i < returned; i++) {
-        size_t ws = heur[i].workspaceSize;
+    for (int i = 0; i < n_cands; i++) {
+        size_t ws = cands[i].ws;
         if (!ensure_lt_workspace(ws)) continue;
 
         /* Warm-up (also ensures any pending weight uploads complete). */
@@ -2509,7 +2566,7 @@ static int lt_autotune_t_bf16(int M, int K, int N,
                             &beta,
                             (const void *)(uintptr_t)g_lt_tune_out, e->c,
                             (void *)(uintptr_t)g_lt_tune_out, e->c,
-                            &heur[i].algo,
+                            &cands[i].algo,
                             (void *)(uintptr_t)g_lt_workspace, ws,
                             (cudaStream_t)g_stream);
         if (st != CUBLAS_STATUS_SUCCESS) continue;
@@ -2527,7 +2584,7 @@ static int lt_autotune_t_bf16(int M, int K, int N,
                                 &beta,
                                 (const void *)(uintptr_t)g_lt_tune_out, e->c,
                                 (void *)(uintptr_t)g_lt_tune_out, e->c,
-                                &heur[i].algo,
+                                &cands[i].algo,
                                 (void *)(uintptr_t)g_lt_workspace, ws,
                                 (cudaStream_t)g_stream);
             if (st != CUBLAS_STATUS_SUCCESS) break;
@@ -2542,7 +2599,7 @@ static int lt_autotune_t_bf16(int M, int K, int N,
 
         if (ms > 0.0f && ms < best_ms) {
             best_ms = ms;
-            best_algo = heur[i].algo;
+            best_algo = cands[i].algo;
             best_ws = ws;
             best_valid = 1;
         }
