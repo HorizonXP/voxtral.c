@@ -3232,6 +3232,90 @@ extern "C" __global__ void vox_f32_vec_to_i8(int8_t *out_i8,
     }
 }
 
+/* Quantize a vector to INT8 and also write back the quantization scale:
+ *   scale = maxabs/127
+ * This is used for INT8 GEMMs where the output must be dequantized. */
+extern "C" __global__ void vox_f32_vec_to_i8_scale(int8_t *out_i8,
+                                                  float *out_scale,
+                                                  const float *in_f32,
+                                                  int n) {
+    if (!out_i8 || !out_scale || !in_f32 || n <= 0) return;
+
+    __shared__ float sh_warp[8];
+    __shared__ float sh_max;
+
+    float tmax = 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        float v = fabsf(in_f32[i]);
+        tmax = (v > tmax) ? v : tmax;
+    }
+    float maxabs = block_reduce_max(tmax, sh_warp);
+    if (threadIdx.x == 0) {
+        sh_max = maxabs;
+        out_scale[0] = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+    }
+    __syncthreads();
+
+    float inv = (sh_max > 0.0f) ? (127.0f / sh_max) : 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        int q = __float2int_rn(in_f32[i] * inv);
+        q = (q > 127) ? 127 : q;
+        q = (q < -127) ? -127 : q;
+        out_i8[i] = (int8_t)q;
+    }
+}
+
+/* BF16 variant of vox_f32_vec_to_i8_scale. */
+extern "C" __global__ void vox_bf16_vec_to_i8_scale(int8_t *out_i8,
+                                                   float *out_scale,
+                                                   const uint16_t *in_bf16,
+                                                   int n) {
+    if (!out_i8 || !out_scale || !in_bf16 || n <= 0) return;
+
+    __shared__ float sh_warp[8];
+    __shared__ float sh_max;
+
+    float tmax = 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        float v = fabsf(vox_bf16_to_f32(in_bf16[i]));
+        tmax = (v > tmax) ? v : tmax;
+    }
+    float maxabs = block_reduce_max(tmax, sh_warp);
+    if (threadIdx.x == 0) {
+        sh_max = maxabs;
+        out_scale[0] = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+    }
+    __syncthreads();
+
+    float inv = (sh_max > 0.0f) ? (127.0f / sh_max) : 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        float v = vox_bf16_to_f32(in_bf16[i]);
+        int q = __float2int_rn(v * inv);
+        q = (q > 127) ? 127 : q;
+        q = (q < -127) ? -127 : q;
+        out_i8[i] = (int8_t)q;
+    }
+}
+
+/* Dequantize INT32 GEMM output to FP32 using per-row weight scales and a
+ * per-vector activation scale:
+ *   out[i] = in[i] * (x_scale[0] * w_scales[i])
+ * If add!=0, accumulate into out[] (residual fusion). */
+extern "C" __global__ void vox_i32_to_f32_row_scale(float *out_f32,
+                                                   const int32_t *in_i32,
+                                                   const float *w_scales,
+                                                   const float *x_scale,
+                                                   int n,
+                                                   int add) {
+    if (!out_f32 || !in_i32 || !w_scales || !x_scale || n <= 0) return;
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    float s = x_scale[0] * w_scales[i];
+    float v = (float)in_i32[i] * s;
+    if (add) out_f32[i] += v;
+    else out_f32[i] = v;
+}
+
 extern "C" __global__ void vox_logits_best_i8_top1(unsigned long long *best_packed,
                                                    const int8_t *x_i8,
                                                    const int8_t *tok_i8,

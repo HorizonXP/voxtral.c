@@ -168,6 +168,9 @@ static CUfunction g_fn_logits_best_bf16_top1 = 0;
 static CUfunction g_fn_logits_best_unpack_u64 = 0;
 static CUfunction g_fn_f32_vec_to_i8 = 0;
 static CUfunction g_fn_logits_best_i8_top1 = 0;
+static CUfunction g_fn_f32_vec_to_i8_scale = 0;
+static CUfunction g_fn_bf16_vec_to_i8_scale = 0;
+static CUfunction g_fn_i32_to_f32_row_scale = 0;
 
 static CUdeviceptr g_dA = 0;
 static CUdeviceptr g_dB = 0;
@@ -409,6 +412,20 @@ static int logits_int8_enabled(void) {
         if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
     }
     const char *env = getenv("VOX_CUDA_LOGITS_INT8");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
+}
+
+static int decoder_int8_enabled(void) {
+    /* Opt-in: INT8 quantized decoder GEMMs (QKV/FFN/WO).
+     * Accuracy may change; default off even under VOX_CUDA_FAST. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    {
+        const char *disable = getenv("VOX_DISABLE_CUDA_DECODER_INT8");
+        if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    }
+    const char *env = getenv("VOX_CUDA_DECODER_INT8");
     cached = (env && env[0] && env[0] != '0');
     return cached;
 }
@@ -976,6 +993,9 @@ static CUdeviceptr g_dec_x_norm = 0;
 static CUdeviceptr g_dec_x_bf16 = 0;
 /* Optional: INT8 quantized decoder step embedding (for INT8 fused logits). */
 static CUdeviceptr g_dec_x_i8 = 0;
+/* Optional: scratch for INT8 decoder GEMMs (quantized input scale + INT32 accumulators). */
+static CUdeviceptr g_dec_x_scale = 0; /* device-side scalar float */
+static CUdeviceptr g_dec_tmp_i32 = 0;
 static CUdeviceptr g_dec_q = 0;
 static CUdeviceptr g_dec_k = 0;
 static CUdeviceptr g_dec_v = 0;
@@ -999,6 +1019,8 @@ static size_t g_cap_dec_x = 0;
 static size_t g_cap_dec_x_norm = 0;
 static size_t g_cap_dec_x_bf16 = 0;
 static size_t g_cap_dec_x_i8 = 0;
+static size_t g_cap_dec_x_scale = 0;
+static size_t g_cap_dec_tmp_i32 = 0;
 static size_t g_cap_dec_q = 0;
 static size_t g_cap_dec_k = 0;
 static size_t g_cap_dec_v = 0;
@@ -1477,6 +1499,273 @@ static CUdeviceptr bf16_cache_get_merged_3(const void *key,
     return dev;
 }
 
+typedef struct {
+    const void *key;
+    CUdeviceptr dev; /* base: [int8 weights][padding][float scales] */
+    size_t bytes;
+    uint64_t use_tick;
+} i8_cache_entry_t;
+
+static i8_cache_entry_t *g_i8_cache = NULL;
+static int g_i8_cache_cap = 0;
+static int g_i8_cache_len = 0;
+static size_t g_i8_cache_bytes = 0;
+static uint64_t g_i8_tick = 1;
+static uint64_t g_i8_hits = 0;
+static uint64_t g_i8_misses = 0;
+static uint64_t g_i8_upload_bytes = 0;
+static uint64_t g_i8_evictions = 0;
+
+static size_t align_up_pow2(size_t x, size_t align) {
+    if (!align) return x;
+    return (x + align - 1) & ~(align - 1);
+}
+
+typedef struct {
+    CUdeviceptr w_i8;
+    CUdeviceptr scales_f32;
+} i8_weight_t;
+
+static void i8_cache_evict_one(void) {
+    if (g_i8_cache_len <= 0) return;
+    g_i8_evictions++;
+    int lru = 0;
+    for (int i = 1; i < g_i8_cache_len; i++) {
+        if (g_i8_cache[i].use_tick < g_i8_cache[lru].use_tick) lru = i;
+    }
+
+    if (g_i8_cache[lru].dev) dev_free(g_i8_cache[lru].dev);
+    if (g_i8_cache[lru].bytes <= g_i8_cache_bytes) g_i8_cache_bytes -= g_i8_cache[lru].bytes;
+
+    g_i8_cache[lru] = g_i8_cache[g_i8_cache_len - 1];
+    g_i8_cache_len--;
+}
+
+static CUdeviceptr i8_cache_lookup_key(const void *key, size_t bytes) {
+    if (!key || bytes == 0) return 0;
+    for (int i = 0; i < g_i8_cache_len; i++) {
+        if (g_i8_cache[i].key == key && g_i8_cache[i].bytes == bytes) {
+            g_i8_cache[i].use_tick = g_i8_tick++;
+            g_i8_hits++;
+            return g_i8_cache[i].dev;
+        }
+    }
+    return 0;
+}
+
+static int i8_cache_ensure_slot(void) {
+    if (g_i8_cache_len < g_i8_cache_cap) return 1;
+    int new_cap = g_i8_cache_cap ? g_i8_cache_cap * 2 : 256;
+    i8_cache_entry_t *tmp = (i8_cache_entry_t *)realloc(g_i8_cache, (size_t)new_cap * sizeof(*tmp));
+    if (!tmp) return 0;
+    g_i8_cache = tmp;
+    g_i8_cache_cap = new_cap;
+    return 1;
+}
+
+static void i8_cache_insert_key(const void *key, CUdeviceptr dev, size_t bytes) {
+    /* Precondition: i8_cache_ensure_slot() already succeeded. */
+    g_i8_cache[g_i8_cache_len++] = (i8_cache_entry_t){
+        .key = key,
+        .dev = dev,
+        .bytes = bytes,
+        .use_tick = g_i8_tick++,
+    };
+    g_i8_cache_bytes += bytes;
+}
+
+static int i8_quantize_bf16_rows_to_dev(CUdeviceptr dW_i8,
+                                        CUdeviceptr dS_f32,
+                                        const uint16_t *src_bf16,
+                                        int rows,
+                                        int cols) {
+    if (!dW_i8 || !dS_f32 || !src_bf16) return 0;
+    if (rows <= 0 || cols <= 0) return 0;
+
+    const int chunk_rows = 512;
+    size_t chunk_bytes_w = (size_t)chunk_rows * (size_t)cols * sizeof(int8_t);
+    size_t chunk_bytes_s = (size_t)chunk_rows * sizeof(float);
+
+    int8_t *h_i8 = (int8_t *)malloc(chunk_bytes_w);
+    float *h_scales = (float *)malloc(chunk_bytes_s);
+    if (!h_i8 || !h_scales) { free(h_i8); free(h_scales); return 0; }
+
+    for (int r0 = 0; r0 < rows; r0 += chunk_rows) {
+        int n = rows - r0;
+        if (n > chunk_rows) n = chunk_rows;
+
+        const uint16_t *src = src_bf16 + (size_t)r0 * (size_t)cols;
+
+        /* Per-row maxabs scale + quantize. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int r = 0; r < n; r++) {
+            const uint16_t *w = src + (size_t)r * (size_t)cols;
+            float maxabs = 0.0f;
+            for (int i = 0; i < cols; i++) {
+                float v = bf16bits_to_f32(w[i]);
+                v = fabsf(v);
+                if (v > maxabs) maxabs = v;
+            }
+            float scale = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+            float inv = (maxabs > 0.0f) ? (127.0f / maxabs) : 0.0f;
+            h_scales[r] = scale;
+
+            int8_t *dst = h_i8 + (size_t)r * (size_t)cols;
+            for (int i = 0; i < cols; i++) {
+                float fv = bf16bits_to_f32(w[i]);
+                int q = (int)lrintf(fv * inv);
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                dst[i] = (int8_t)q;
+            }
+        }
+
+        size_t bytes_w = (size_t)n * (size_t)cols * sizeof(int8_t);
+        size_t bytes_s = (size_t)n * sizeof(float);
+        CUresult r;
+        r = cuMemcpyHtoD(dW_i8 + (CUdeviceptr)((size_t)r0 * (size_t)cols * sizeof(int8_t)), h_i8, bytes_w);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(i8_w)", r); free(h_i8); free(h_scales); return 0; }
+        r = cuMemcpyHtoD(dS_f32 + (CUdeviceptr)((size_t)r0 * sizeof(float)), h_scales, bytes_s);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(i8_scales)", r); free(h_i8); free(h_scales); return 0; }
+        g_i8_upload_bytes += (uint64_t)(bytes_w + bytes_s);
+    }
+
+    free(h_i8);
+    free(h_scales);
+    return 1;
+}
+
+static i8_weight_t i8_cache_get_bf16(const uint16_t *host_bf16, int cols, int rows) {
+    if (!host_bf16) return (i8_weight_t){0};
+    if (rows <= 0 || cols <= 0) return (i8_weight_t){0};
+    if (!vox_cuda_available()) return (i8_weight_t){0};
+    (void)cuCtxSetCurrent(g_ctx);
+
+    size_t bytes_w = (size_t)rows * (size_t)cols * sizeof(int8_t);
+    size_t off_s = align_up_pow2(bytes_w, 256);
+    size_t bytes_s = (size_t)rows * sizeof(float);
+    size_t bytes_total = off_s + bytes_s;
+
+    CUdeviceptr cached = i8_cache_lookup_key(host_bf16, bytes_total);
+    if (cached) return (i8_weight_t){ .w_i8 = cached, .scales_f32 = cached + (CUdeviceptr)off_s };
+    g_i8_misses++;
+
+    if (!i8_cache_ensure_slot()) return (i8_weight_t){0};
+
+    CUdeviceptr dev = 0;
+    if (!dev_alloc(&dev, bytes_total)) {
+        while (g_i8_cache_len > 0) {
+            i8_cache_evict_one();
+            if (dev_alloc(&dev, bytes_total)) break;
+        }
+        if (!dev) return (i8_weight_t){0};
+    }
+
+    CUdeviceptr dW = dev;
+    CUdeviceptr dS = dev + (CUdeviceptr)off_s;
+    if (!i8_quantize_bf16_rows_to_dev(dW, dS, host_bf16, rows, cols)) {
+        dev_free(dev);
+        return (i8_weight_t){0};
+    }
+
+    i8_cache_insert_key(host_bf16, dev, bytes_total);
+    return (i8_weight_t){ .w_i8 = dev, .scales_f32 = dS };
+}
+
+static i8_weight_t i8_cache_get_merged_2(const void *key,
+                                        const uint16_t *h0, int rows0,
+                                        const uint16_t *h1, int rows1,
+                                        int cols) {
+    if (!key || !h0 || !h1) return (i8_weight_t){0};
+    if (rows0 <= 0 || rows1 <= 0 || cols <= 0) return (i8_weight_t){0};
+    if (!vox_cuda_available()) return (i8_weight_t){0};
+    (void)cuCtxSetCurrent(g_ctx);
+
+    int rows = rows0 + rows1;
+    size_t bytes_w = (size_t)rows * (size_t)cols * sizeof(int8_t);
+    size_t off_s = align_up_pow2(bytes_w, 256);
+    size_t bytes_s = (size_t)rows * sizeof(float);
+    size_t bytes_total = off_s + bytes_s;
+
+    CUdeviceptr cached = i8_cache_lookup_key(key, bytes_total);
+    if (cached) return (i8_weight_t){ .w_i8 = cached, .scales_f32 = cached + (CUdeviceptr)off_s };
+    g_i8_misses++;
+
+    if (!i8_cache_ensure_slot()) return (i8_weight_t){0};
+
+    CUdeviceptr dev = 0;
+    if (!dev_alloc(&dev, bytes_total)) {
+        while (g_i8_cache_len > 0) {
+            i8_cache_evict_one();
+            if (dev_alloc(&dev, bytes_total)) break;
+        }
+        if (!dev) return (i8_weight_t){0};
+    }
+
+    CUdeviceptr dW = dev;
+    CUdeviceptr dS = dev + (CUdeviceptr)off_s;
+
+    /* First block */
+    if (!i8_quantize_bf16_rows_to_dev(dW, dS, h0, rows0, cols)) { dev_free(dev); return (i8_weight_t){0}; }
+    /* Second block */
+    CUdeviceptr dW1 = dW + (CUdeviceptr)((size_t)rows0 * (size_t)cols * sizeof(int8_t));
+    CUdeviceptr dS1 = dS + (CUdeviceptr)((size_t)rows0 * sizeof(float));
+    if (!i8_quantize_bf16_rows_to_dev(dW1, dS1, h1, rows1, cols)) { dev_free(dev); return (i8_weight_t){0}; }
+
+    i8_cache_insert_key(key, dev, bytes_total);
+    return (i8_weight_t){ .w_i8 = dev, .scales_f32 = dS };
+}
+
+static i8_weight_t i8_cache_get_merged_3(const void *key,
+                                        const uint16_t *h0, int rows0,
+                                        const uint16_t *h1, int rows1,
+                                        const uint16_t *h2, int rows2,
+                                        int cols) {
+    if (!key || !h0 || !h1 || !h2) return (i8_weight_t){0};
+    if (rows0 <= 0 || rows1 <= 0 || rows2 <= 0 || cols <= 0) return (i8_weight_t){0};
+    if (!vox_cuda_available()) return (i8_weight_t){0};
+    (void)cuCtxSetCurrent(g_ctx);
+
+    int rows = rows0 + rows1 + rows2;
+    size_t bytes_w = (size_t)rows * (size_t)cols * sizeof(int8_t);
+    size_t off_s = align_up_pow2(bytes_w, 256);
+    size_t bytes_s = (size_t)rows * sizeof(float);
+    size_t bytes_total = off_s + bytes_s;
+
+    CUdeviceptr cached = i8_cache_lookup_key(key, bytes_total);
+    if (cached) return (i8_weight_t){ .w_i8 = cached, .scales_f32 = cached + (CUdeviceptr)off_s };
+    g_i8_misses++;
+
+    if (!i8_cache_ensure_slot()) return (i8_weight_t){0};
+
+    CUdeviceptr dev = 0;
+    if (!dev_alloc(&dev, bytes_total)) {
+        while (g_i8_cache_len > 0) {
+            i8_cache_evict_one();
+            if (dev_alloc(&dev, bytes_total)) break;
+        }
+        if (!dev) return (i8_weight_t){0};
+    }
+
+    CUdeviceptr dW = dev;
+    CUdeviceptr dS = dev + (CUdeviceptr)off_s;
+
+    if (!i8_quantize_bf16_rows_to_dev(dW, dS, h0, rows0, cols)) { dev_free(dev); return (i8_weight_t){0}; }
+
+    CUdeviceptr dW1 = dW + (CUdeviceptr)((size_t)rows0 * (size_t)cols * sizeof(int8_t));
+    CUdeviceptr dS1 = dS + (CUdeviceptr)((size_t)rows0 * sizeof(float));
+    if (!i8_quantize_bf16_rows_to_dev(dW1, dS1, h1, rows1, cols)) { dev_free(dev); return (i8_weight_t){0}; }
+
+    CUdeviceptr dW2 = dW1 + (CUdeviceptr)((size_t)rows1 * (size_t)cols * sizeof(int8_t));
+    CUdeviceptr dS2 = dS1 + (CUdeviceptr)((size_t)rows1 * sizeof(float));
+    if (!i8_quantize_bf16_rows_to_dev(dW2, dS2, h2, rows2, cols)) { dev_free(dev); return (i8_weight_t){0}; }
+
+    i8_cache_insert_key(key, dev, bytes_total);
+    return (i8_weight_t){ .w_i8 = dev, .scales_f32 = dS };
+}
+
 static CUdeviceptr f32_cache_get(const float *host, size_t bytes) {
     if (!host || bytes == 0) return 0;
     if (!vox_cuda_available()) return 0;
@@ -1734,6 +2023,12 @@ static int cuda_load_kernel_module(void) {
                 (void)cuModuleGetFunction(&g_fn_f32_vec_to_i8, g_mod, "vox_f32_vec_to_i8");
             if (!g_fn_logits_best_i8_top1)
                 (void)cuModuleGetFunction(&g_fn_logits_best_i8_top1, g_mod, "vox_logits_best_i8_top1");
+            if (!g_fn_f32_vec_to_i8_scale)
+                (void)cuModuleGetFunction(&g_fn_f32_vec_to_i8_scale, g_mod, "vox_f32_vec_to_i8_scale");
+            if (!g_fn_bf16_vec_to_i8_scale)
+                (void)cuModuleGetFunction(&g_fn_bf16_vec_to_i8_scale, g_mod, "vox_bf16_vec_to_i8_scale");
+            if (!g_fn_i32_to_f32_row_scale)
+                (void)cuModuleGetFunction(&g_fn_i32_to_f32_row_scale, g_mod, "vox_i32_to_f32_row_scale");
         }
         return 1;
     }
@@ -1807,6 +2102,9 @@ static int cuda_load_kernel_module(void) {
     (void)cuModuleGetFunction(&g_fn_logits_best_unpack_u64, g_mod, "vox_logits_best_unpack_u64");
     (void)cuModuleGetFunction(&g_fn_f32_vec_to_i8, g_mod, "vox_f32_vec_to_i8");
     (void)cuModuleGetFunction(&g_fn_logits_best_i8_top1, g_mod, "vox_logits_best_i8_top1");
+    (void)cuModuleGetFunction(&g_fn_f32_vec_to_i8_scale, g_mod, "vox_f32_vec_to_i8_scale");
+    (void)cuModuleGetFunction(&g_fn_bf16_vec_to_i8_scale, g_mod, "vox_bf16_vec_to_i8_scale");
+    (void)cuModuleGetFunction(&g_fn_i32_to_f32_row_scale, g_mod, "vox_i32_to_f32_row_scale");
 
     /* Optional legacy kernel (kept for now; not used in the fast path). */
     (void)cuModuleGetFunction(&g_fn_causal_attn, g_mod, "vox_causal_attn_f32");
@@ -2428,6 +2726,69 @@ static int launch_f32_vec_to_i8(CUdeviceptr dst_i8,
     return 1;
 }
 
+static int launch_f32_vec_to_i8_scale(CUdeviceptr dst_i8,
+                                      CUdeviceptr dst_scale,
+                                      CUdeviceptr src_f32,
+                                      int n) {
+    if (!dst_i8 || !dst_scale || !src_f32) return 0;
+    if (n <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_f32_vec_to_i8_scale) return 0;
+
+    int threads = 256;
+    void *params[] = { &dst_i8, &dst_scale, &src_f32, &n };
+    CUresult r = cuLaunchKernel(g_fn_f32_vec_to_i8_scale,
+                                1, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(f32_vec_to_i8_scale)", r); return 0; }
+    return 1;
+}
+
+static int launch_bf16_vec_to_i8_scale(CUdeviceptr dst_i8,
+                                       CUdeviceptr dst_scale,
+                                       CUdeviceptr src_bf16,
+                                       int n) {
+    if (!dst_i8 || !dst_scale || !src_bf16) return 0;
+    if (n <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_bf16_vec_to_i8_scale) return 0;
+
+    int threads = 256;
+    void *params[] = { &dst_i8, &dst_scale, &src_bf16, &n };
+    CUresult r = cuLaunchKernel(g_fn_bf16_vec_to_i8_scale,
+                                1, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(bf16_vec_to_i8_scale)", r); return 0; }
+    return 1;
+}
+
+static int launch_i32_to_f32_row_scale(CUdeviceptr dst_f32,
+                                      CUdeviceptr src_i32,
+                                      CUdeviceptr w_scales,
+                                      CUdeviceptr x_scale,
+                                      int n,
+                                      int add) {
+    if (!dst_f32 || !src_i32 || !w_scales || !x_scale) return 0;
+    if (n <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_i32_to_f32_row_scale) return 0;
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    void *params[] = { &dst_f32, &src_i32, &w_scales, &x_scale, &n, &add };
+    CUresult r = cuLaunchKernel(g_fn_i32_to_f32_row_scale,
+                                blocks, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(i32_to_f32_row_scale)", r); return 0; }
+    return 1;
+}
+
 static int launch_logits_best_i8_top1(CUdeviceptr best_packed,
                                       CUdeviceptr x_i8,
                                       CUdeviceptr tok_i8,
@@ -2884,6 +3245,31 @@ static int gemm_t_bf16_bf16_f32(CUdeviceptr dC,
                                 int K,
                                 int N) {
     return gemm_t_bf16_bf16_f32_beta(dC, dA_bf16, dB_bf16, M, K, N, 0.0f);
+}
+
+static int gemm_t_i8_i8_i32(CUdeviceptr dC_i32,
+                            CUdeviceptr dA_i8,
+                            CUdeviceptr dB_i8,
+                            int M,
+                            int K,
+                            int N) {
+    if (!dC_i32 || !dA_i8 || !dB_i8) return 0;
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    cublasStatus_t st = cublasGemmEx(
+        g_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        (const void *)(uintptr_t)dA_i8, CUDA_R_8I, K,
+        (const void *)(uintptr_t)dB_i8, CUDA_R_8I, K,
+        &beta,
+        (void *)(uintptr_t)dC_i32, CUDA_R_32I, N,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return st == CUBLAS_STATUS_SUCCESS;
 }
 
 static int gemm_f32_rowmajor_f32_dev(CUdeviceptr dC,
@@ -3716,6 +4102,8 @@ void vox_cuda_shutdown(void) {
     shutdown_dev_free_ptr(&g_dec_x_norm);
     shutdown_dev_free_ptr(&g_dec_x_bf16);
     shutdown_dev_free_ptr(&g_dec_x_i8);
+    shutdown_dev_free_ptr(&g_dec_x_scale);
+    shutdown_dev_free_ptr(&g_dec_tmp_i32);
     shutdown_dev_free_ptr(&g_dec_q);
     shutdown_dev_free_ptr(&g_dec_k);
     shutdown_dev_free_ptr(&g_dec_v);
@@ -3733,6 +4121,8 @@ void vox_cuda_shutdown(void) {
     shutdown_dev_free_ptr(&g_dec_best);
     shutdown_dev_free_ptr(&g_dec_best_packed);
     g_dec_x = g_dec_x_norm = g_dec_x_bf16 = g_dec_x_i8 = 0;
+    g_dec_x_scale = 0;
+    g_dec_tmp_i32 = 0;
     g_dec_q = g_dec_k = g_dec_v = g_dec_qkv = 0;
     g_dec_attn = g_dec_attn_bf16 = 0;
     g_dec_proj = g_dec_gate = g_dec_up = g_dec_ffn13 = 0;
@@ -3740,6 +4130,8 @@ void vox_cuda_shutdown(void) {
     g_dec_rope_freqs = g_dec_logits = g_dec_best = g_dec_best_packed = 0;
     g_cap_dec_x = g_cap_dec_x_norm = g_cap_dec_x_bf16 = 0;
     g_cap_dec_x_i8 = 0;
+    g_cap_dec_x_scale = 0;
+    g_cap_dec_tmp_i32 = 0;
     g_cap_dec_q = g_cap_dec_k = g_cap_dec_v = g_cap_dec_qkv = 0;
     g_cap_dec_attn = g_cap_dec_attn_bf16 = 0;
     g_cap_dec_proj = g_cap_dec_gate = g_cap_dec_up = g_cap_dec_ffn13 = 0;
@@ -3851,6 +4243,9 @@ void vox_cuda_shutdown(void) {
     g_fn_logits_best_unpack_u64 = 0;
     g_fn_f32_vec_to_i8 = 0;
     g_fn_logits_best_i8_top1 = 0;
+    g_fn_f32_vec_to_i8_scale = 0;
+    g_fn_bf16_vec_to_i8_scale = 0;
+    g_fn_i32_to_f32_row_scale = 0;
 
     free((void *)g_batched_A);
     free((void *)g_batched_B);
@@ -3884,6 +4279,30 @@ void vox_cuda_shutdown(void) {
     g_bf16_cache_len = 0;
     g_bf16_cache_bytes = 0;
     g_bf16_cache_limit = 0;
+
+    if (getenv("VOX_PRINT_TIMINGS")) {
+        fprintf(stderr,
+                "[cuda] i8_cache: hits=%llu misses=%llu evictions=%llu entries=%d bytes=%.2f GiB uploaded=%.2f GiB\n",
+                (unsigned long long)g_i8_hits,
+                (unsigned long long)g_i8_misses,
+                (unsigned long long)g_i8_evictions,
+                g_i8_cache_len,
+                (double)g_i8_cache_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)g_i8_upload_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    g_i8_hits = g_i8_misses = 0;
+    g_i8_upload_bytes = 0;
+    g_i8_evictions = 0;
+
+    for (int i = 0; i < g_i8_cache_len; i++) {
+        if (g_i8_cache[i].dev) dev_free(g_i8_cache[i].dev);
+        g_i8_cache[i].dev = 0;
+    }
+    free(g_i8_cache);
+    g_i8_cache = NULL;
+    g_i8_cache_cap = 0;
+    g_i8_cache_len = 0;
+    g_i8_cache_bytes = 0;
 
     for (int i = 0; i < g_f32_cache_len; i++) {
         if (g_f32_cache[i].dev) dev_free(g_f32_cache[i].dev);
@@ -5279,6 +5698,8 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
     int use_merge_qkv = merge_qkv_enabled();
     int use_merge_ffn13 = merge_ffn13_enabled();
     int use_rope_dev = (rope_dev_enabled() && g_fn_rope_freqs_1pos);
+    int use_dec_int8 = (decoder_int8_enabled() &&
+                        g_fn_f32_vec_to_i8_scale && g_fn_bf16_vec_to_i8_scale && g_fn_i32_to_f32_row_scale);
 
     /* Ensure device KV cache is ready and large enough. */
     int want_max_seq = ctx->kv_cache_max > 0 ? ctx->kv_cache_max : (VOX_DEC_WINDOW + 2048);
@@ -5286,10 +5707,14 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
 
     /* Ensure decoder work buffers exist (M=1 step). */
     size_t bytes_rope = (size_t)((head_dim / 2) * 2) * sizeof(float);
+    int i8_elems = use_dec_int8 ? hidden : dim;
     if (!ensure_buffer(&g_dec_x, &g_cap_dec_x, (size_t)dim * sizeof(float)) ||
         !ensure_buffer(&g_dec_x_norm, &g_cap_dec_x_norm, (size_t)dim * sizeof(float)) ||
         !ensure_buffer(&g_dec_x_bf16, &g_cap_dec_x_bf16, (size_t)dim * sizeof(uint16_t)) ||
-        (logits_mode == 2 && !ensure_buffer(&g_dec_x_i8, &g_cap_dec_x_i8, (size_t)dim * sizeof(int8_t))) ||
+        ((logits_mode == 2 || use_dec_int8) &&
+         !ensure_buffer(&g_dec_x_i8, &g_cap_dec_x_i8, (size_t)i8_elems * sizeof(int8_t))) ||
+        (use_dec_int8 && !ensure_buffer(&g_dec_x_scale, &g_cap_dec_x_scale, sizeof(float))) ||
+        (use_dec_int8 && !ensure_buffer(&g_dec_tmp_i32, &g_cap_dec_tmp_i32, (size_t)(2 * hidden) * sizeof(int32_t))) ||
         !ensure_buffer(&g_dec_q, &g_cap_dec_q, (size_t)q_dim * sizeof(float)) ||
         !ensure_buffer(&g_dec_k, &g_cap_dec_k, (size_t)kv_dim * sizeof(float)) ||
         !ensure_buffer(&g_dec_v, &g_cap_dec_v, (size_t)kv_dim * sizeof(float)) ||
@@ -5385,7 +5810,8 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
 
     /* Warm weight caches; graphs require stable device pointers. If we evict
      * while warming, disable graphs (memory pressure => pointers may not stay stable). */
-    uint64_t ev_before = g_bf16_evictions;
+    uint64_t bf16_ev_before = g_bf16_evictions;
+    uint64_t i8_ev_before = g_i8_evictions;
     vox_decoder_t *dec = &ctx->decoder;
     CUdeviceptr tune_Wqkv0 = 0;
     CUdeviceptr tune_Wq0 = 0;
@@ -5402,52 +5828,87 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
         size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        if (use_merge_qkv) {
-            CUdeviceptr d = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                    l->wq_weight_bf16, bytes_wq,
-                                                    l->wk_weight_bf16, bytes_wkv,
-                                                    l->wv_weight_bf16, bytes_wkv);
-            if (!d) {
-                return 0;
+        if (use_dec_int8) {
+            if (use_merge_qkv) {
+                i8_weight_t w = i8_cache_get_merged_3(l->wq_weight_bf16,
+                                                      l->wq_weight_bf16, q_dim,
+                                                      l->wk_weight_bf16, kv_dim,
+                                                      l->wv_weight_bf16, kv_dim,
+                                                      dim);
+                if (!w.w_i8 || !w.scales_f32) return 0;
+            } else {
+                i8_weight_t wq = i8_cache_get_bf16(l->wq_weight_bf16, dim, q_dim);
+                i8_weight_t wk = i8_cache_get_bf16(l->wk_weight_bf16, dim, kv_dim);
+                i8_weight_t wv = i8_cache_get_bf16(l->wv_weight_bf16, dim, kv_dim);
+                if (!wq.w_i8 || !wk.w_i8 || !wv.w_i8) return 0;
             }
-            if (layer == 0) tune_Wqkv0 = d;
-        } else {
-            CUdeviceptr d;
-            d = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            if (!d) return 0;
-            if (layer == 0) tune_Wq0 = d;
-            d = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            if (!d) return 0;
-            if (layer == 0) tune_Wk0 = d;
-            d = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!d) return 0;
-            if (layer == 0) tune_Wv0 = d;
-        }
-        {
-            CUdeviceptr d = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-            if (!d) return 0;
-            if (layer == 0) tune_Wo0 = d;
-        }
-        if (use_merge_ffn13) {
-            CUdeviceptr d = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                    l->w1_weight_bf16, bytes_w1,
-                                                    l->w3_weight_bf16, bytes_w1);
-            if (!d) {
-                return 0;
+            {
+                i8_weight_t wo = i8_cache_get_bf16(l->wo_weight_bf16, q_dim, dim);
+                if (!wo.w_i8 || !wo.scales_f32) return 0;
             }
-            if (layer == 0) tune_W130 = d;
+            if (use_merge_ffn13) {
+                i8_weight_t w13 = i8_cache_get_merged_2(l->w1_weight_bf16,
+                                                        l->w1_weight_bf16, hidden,
+                                                        l->w3_weight_bf16, hidden,
+                                                        dim);
+                if (!w13.w_i8 || !w13.scales_f32) return 0;
+            } else {
+                i8_weight_t w1 = i8_cache_get_bf16(l->w1_weight_bf16, dim, hidden);
+                i8_weight_t w3 = i8_cache_get_bf16(l->w3_weight_bf16, dim, hidden);
+                if (!w1.w_i8 || !w3.w_i8) return 0;
+            }
+            {
+                i8_weight_t w2 = i8_cache_get_bf16(l->w2_weight_bf16, hidden, dim);
+                if (!w2.w_i8 || !w2.scales_f32) return 0;
+            }
         } else {
-            CUdeviceptr d;
-            d = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            if (!d) return 0;
-            if (layer == 0) tune_W10 = d;
-            d = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!d) return 0;
-        }
-        {
-            CUdeviceptr d = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-            if (!d) return 0;
-            if (layer == 0) tune_W20 = d;
+            if (use_merge_qkv) {
+                CUdeviceptr d = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                        l->wq_weight_bf16, bytes_wq,
+                                                        l->wk_weight_bf16, bytes_wkv,
+                                                        l->wv_weight_bf16, bytes_wkv);
+                if (!d) {
+                    return 0;
+                }
+                if (layer == 0) tune_Wqkv0 = d;
+            } else {
+                CUdeviceptr d;
+                d = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                if (!d) return 0;
+                if (layer == 0) tune_Wq0 = d;
+                d = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                if (!d) return 0;
+                if (layer == 0) tune_Wk0 = d;
+                d = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!d) return 0;
+                if (layer == 0) tune_Wv0 = d;
+            }
+            {
+                CUdeviceptr d = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+                if (!d) return 0;
+                if (layer == 0) tune_Wo0 = d;
+            }
+            if (use_merge_ffn13) {
+                CUdeviceptr d = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                        l->w1_weight_bf16, bytes_w1,
+                                                        l->w3_weight_bf16, bytes_w1);
+                if (!d) {
+                    return 0;
+                }
+                if (layer == 0) tune_W130 = d;
+            } else {
+                CUdeviceptr d;
+                d = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                if (!d) return 0;
+                if (layer == 0) tune_W10 = d;
+                d = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!d) return 0;
+            }
+            {
+                CUdeviceptr d = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+                if (!d) return 0;
+                if (layer == 0) tune_W20 = d;
+            }
         }
 
         if (!f32_cache_get(l->attention_norm, (size_t)dim * sizeof(float))) return 0;
@@ -5500,7 +5961,8 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
         }
     }
 
-    if (g_bf16_evictions != ev_before) return 0;
+    if (g_bf16_evictions != bf16_ev_before) return 0;
+    if (use_dec_int8 && g_i8_evictions != i8_ev_before) return 0;
     return 1;
 }
 
@@ -5540,6 +6002,8 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     int use_merge_qkv = merge_qkv_enabled();
     int use_merge_ffn13 = merge_ffn13_enabled();
     int use_rope_dev = (rope_dev_enabled() && g_fn_rope_freqs_1pos && g_dec_logical_pos_dev && g_dec_rope_inv_freq);
+    int use_dec_int8 = (decoder_int8_enabled() &&
+                        g_fn_f32_vec_to_i8_scale && g_fn_bf16_vec_to_i8_scale && g_fn_i32_to_f32_row_scale);
 
     vox_decoder_t *dec = &ctx->decoder;
 
@@ -5554,10 +6018,50 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     CUdeviceptr dW1[VOX_DEC_LAYERS];
     CUdeviceptr dW3[VOX_DEC_LAYERS];
     CUdeviceptr dW2[VOX_DEC_LAYERS];
+    CUdeviceptr dWqkv_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dWqkv_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dWq_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dWq_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dWk_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dWk_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dWv_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dWv_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dWo_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dWo_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dW13_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dW13_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dW1_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dW1_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dW3_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dW3_scales[VOX_DEC_LAYERS];
+    CUdeviceptr dW2_i8[VOX_DEC_LAYERS];
+    CUdeviceptr dW2_scales[VOX_DEC_LAYERS];
     CUdeviceptr dAda[VOX_DEC_LAYERS];
     memset(dWqkv, 0, sizeof(dWqkv));
     memset(dW13, 0, sizeof(dW13));
     memset(dAda, 0, sizeof(dAda));
+    memset(dWqkv_i8, 0, sizeof(dWqkv_i8));
+    memset(dWqkv_scales, 0, sizeof(dWqkv_scales));
+    memset(dWq_i8, 0, sizeof(dWq_i8));
+    memset(dWq_scales, 0, sizeof(dWq_scales));
+    memset(dWk_i8, 0, sizeof(dWk_i8));
+    memset(dWk_scales, 0, sizeof(dWk_scales));
+    memset(dWv_i8, 0, sizeof(dWv_i8));
+    memset(dWv_scales, 0, sizeof(dWv_scales));
+    memset(dWo_i8, 0, sizeof(dWo_i8));
+    memset(dWo_scales, 0, sizeof(dWo_scales));
+    memset(dW13_i8, 0, sizeof(dW13_i8));
+    memset(dW13_scales, 0, sizeof(dW13_scales));
+    memset(dW1_i8, 0, sizeof(dW1_i8));
+    memset(dW1_scales, 0, sizeof(dW1_scales));
+    memset(dW3_i8, 0, sizeof(dW3_i8));
+    memset(dW3_scales, 0, sizeof(dW3_scales));
+    memset(dW2_i8, 0, sizeof(dW2_i8));
+    memset(dW2_scales, 0, sizeof(dW2_scales));
+
+    if (use_dec_int8 && (!g_dec_x_i8 || !g_dec_x_scale || !g_dec_tmp_i32)) {
+        use_dec_int8 = 0;
+    }
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
@@ -5571,31 +6075,79 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        if (use_merge_qkv) {
-            dWqkv[layer] = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                   l->wq_weight_bf16, bytes_wq,
-                                                   l->wk_weight_bf16, bytes_wkv,
-                                                   l->wv_weight_bf16, bytes_wkv);
-            if (!dWqkv[layer]) return 0;
+        if (use_dec_int8) {
+            if (use_merge_qkv) {
+                i8_weight_t w = i8_cache_get_merged_3(l->wq_weight_bf16,
+                                                      l->wq_weight_bf16, q_dim,
+                                                      l->wk_weight_bf16, kv_dim,
+                                                      l->wv_weight_bf16, kv_dim,
+                                                      dim);
+                if (!w.w_i8 || !w.scales_f32) return 0;
+                dWqkv_i8[layer] = w.w_i8;
+                dWqkv_scales[layer] = w.scales_f32;
+            } else {
+                i8_weight_t wq = i8_cache_get_bf16(l->wq_weight_bf16, dim, q_dim);
+                i8_weight_t wk = i8_cache_get_bf16(l->wk_weight_bf16, dim, kv_dim);
+                i8_weight_t wv = i8_cache_get_bf16(l->wv_weight_bf16, dim, kv_dim);
+                if (!wq.w_i8 || !wk.w_i8 || !wv.w_i8) return 0;
+                dWq_i8[layer] = wq.w_i8; dWq_scales[layer] = wq.scales_f32;
+                dWk_i8[layer] = wk.w_i8; dWk_scales[layer] = wk.scales_f32;
+                dWv_i8[layer] = wv.w_i8; dWv_scales[layer] = wv.scales_f32;
+            }
+            {
+                i8_weight_t wo = i8_cache_get_bf16(l->wo_weight_bf16, q_dim, dim);
+                if (!wo.w_i8 || !wo.scales_f32) return 0;
+                dWo_i8[layer] = wo.w_i8;
+                dWo_scales[layer] = wo.scales_f32;
+            }
+            if (use_merge_ffn13) {
+                i8_weight_t w13 = i8_cache_get_merged_2(l->w1_weight_bf16,
+                                                        l->w1_weight_bf16, hidden,
+                                                        l->w3_weight_bf16, hidden,
+                                                        dim);
+                if (!w13.w_i8 || !w13.scales_f32) return 0;
+                dW13_i8[layer] = w13.w_i8;
+                dW13_scales[layer] = w13.scales_f32;
+            } else {
+                i8_weight_t w1 = i8_cache_get_bf16(l->w1_weight_bf16, dim, hidden);
+                i8_weight_t w3 = i8_cache_get_bf16(l->w3_weight_bf16, dim, hidden);
+                if (!w1.w_i8 || !w3.w_i8) return 0;
+                dW1_i8[layer] = w1.w_i8; dW1_scales[layer] = w1.scales_f32;
+                dW3_i8[layer] = w3.w_i8; dW3_scales[layer] = w3.scales_f32;
+            }
+            {
+                i8_weight_t w2 = i8_cache_get_bf16(l->w2_weight_bf16, hidden, dim);
+                if (!w2.w_i8 || !w2.scales_f32) return 0;
+                dW2_i8[layer] = w2.w_i8;
+                dW2_scales[layer] = w2.scales_f32;
+            }
         } else {
-            dWq[layer] = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            dWk[layer] = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            dWv[layer] = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!dWq[layer] || !dWk[layer] || !dWv[layer]) return 0;
+            if (use_merge_qkv) {
+                dWqkv[layer] = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                       l->wq_weight_bf16, bytes_wq,
+                                                       l->wk_weight_bf16, bytes_wkv,
+                                                       l->wv_weight_bf16, bytes_wkv);
+                if (!dWqkv[layer]) return 0;
+            } else {
+                dWq[layer] = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                dWk[layer] = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                dWv[layer] = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!dWq[layer] || !dWk[layer] || !dWv[layer]) return 0;
+            }
+            dWo[layer] = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (use_merge_ffn13) {
+                dW13[layer] = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                      l->w1_weight_bf16, bytes_w1,
+                                                      l->w3_weight_bf16, bytes_w1);
+                if (!dW13[layer]) return 0;
+            } else {
+                dW1[layer] = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                dW3[layer] = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!dW1[layer] || !dW3[layer]) return 0;
+            }
+            dW2[layer] = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dWo[layer] || !dW2[layer]) return 0;
         }
-        dWo[layer] = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (use_merge_ffn13) {
-            dW13[layer] = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                  l->w1_weight_bf16, bytes_w1,
-                                                  l->w3_weight_bf16, bytes_w1);
-            if (!dW13[layer]) return 0;
-        } else {
-            dW1[layer] = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            dW3[layer] = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!dW1[layer] || !dW3[layer]) return 0;
-        }
-        dW2[layer] = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dWo[layer] || !dW2[layer]) return 0;
 
         if (ctx->ada_scale) {
             const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
@@ -5750,19 +6302,44 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
 
         /* Q,K,V projections */
         CUdeviceptr dQ = 0, dK = 0, dV = 0;
-        if (use_merge_qkv) {
-            int qkv_dim = q_dim + 2 * kv_dim;
-            if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv[layer], 1, dim, qkv_dim)) goto capture_fail;
-            dQ = g_dec_qkv;
-            dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
-            dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+        if (use_dec_int8) {
+            if (!launch_bf16_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_x_bf16, dim)) goto capture_fail;
+            if (use_merge_qkv) {
+                int qkv_out = q_dim + 2 * kv_dim;
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dWqkv_i8[layer], g_dec_x_i8, 1, dim, qkv_out)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(g_dec_qkv, g_dec_tmp_i32, dWqkv_scales[layer], g_dec_x_scale, qkv_out, 0)) goto capture_fail;
+                dQ = g_dec_qkv;
+                dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            } else {
+                dQ = g_dec_q;
+                dK = g_dec_k;
+                dV = g_dec_v;
+
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dWq_i8[layer], g_dec_x_i8, 1, dim, q_dim)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(dQ, g_dec_tmp_i32, dWq_scales[layer], g_dec_x_scale, q_dim, 0)) goto capture_fail;
+
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dWk_i8[layer], g_dec_x_i8, 1, dim, kv_dim)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(dK, g_dec_tmp_i32, dWk_scales[layer], g_dec_x_scale, kv_dim, 0)) goto capture_fail;
+
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dWv_i8[layer], g_dec_x_i8, 1, dim, kv_dim)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(dV, g_dec_tmp_i32, dWv_scales[layer], g_dec_x_scale, kv_dim, 0)) goto capture_fail;
+            }
         } else {
-            dQ = g_dec_q;
-            dK = g_dec_k;
-            dV = g_dec_v;
-            if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq[layer], 1, dim, q_dim)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk[layer], 1, dim, kv_dim)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv[layer], 1, dim, kv_dim)) goto capture_fail;
+            if (use_merge_qkv) {
+                int qkv_dim = q_dim + 2 * kv_dim;
+                if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv[layer], 1, dim, qkv_dim)) goto capture_fail;
+                dQ = g_dec_qkv;
+                dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            } else {
+                dQ = g_dec_q;
+                dK = g_dec_k;
+                dV = g_dec_v;
+                if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq[layer], 1, dim, q_dim)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk[layer], 1, dim, kv_dim)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv[layer], 1, dim, kv_dim)) goto capture_fail;
+            }
         }
 
         /* RoPE */
@@ -5870,10 +6447,16 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         }
 
         /* Output projection + residual */
-        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) goto capture_fail;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim)) goto capture_fail;
-            if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) goto capture_fail;
+        if (use_dec_int8) {
+            if (!launch_f32_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_attn, q_dim)) goto capture_fail;
+            if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dWo_i8[layer], g_dec_x_i8, 1, q_dim, dim)) goto capture_fail;
+            if (!launch_i32_to_f32_row_scale(g_dec_x, g_dec_tmp_i32, dWo_scales[layer], g_dec_x_scale, dim, 1)) goto capture_fail;
+        } else {
+            if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) goto capture_fail;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim)) goto capture_fail;
+                if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) goto capture_fail;
+            }
         }
 
         /* FFN */
@@ -5889,22 +6472,45 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         }
 
         CUdeviceptr dGate = g_dec_gate;
-        if (use_merge_ffn13) {
-            int n13 = 2 * hidden;
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13[layer], 1, dim, n13)) goto capture_fail;
-            dGate = g_dec_ffn13;
-            CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
-            if (!launch_silu_mul_inplace(dGate, dUp, hidden)) goto capture_fail;
-        } else {
-            if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1[layer], 1, dim, hidden)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3[layer], 1, dim, hidden)) goto capture_fail;
-            if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) goto capture_fail;
-        }
+        if (use_dec_int8) {
+            if (!launch_bf16_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_x_bf16, dim)) goto capture_fail;
+            if (use_merge_ffn13) {
+                int n13 = 2 * hidden;
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dW13_i8[layer], g_dec_x_i8, 1, dim, n13)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(g_dec_ffn13, g_dec_tmp_i32, dW13_scales[layer], g_dec_x_scale, n13, 0)) goto capture_fail;
+                dGate = g_dec_ffn13;
+                CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                if (!launch_silu_mul_inplace(dGate, dUp, hidden)) goto capture_fail;
+            } else {
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dW1_i8[layer], g_dec_x_i8, 1, dim, hidden)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(g_dec_gate, g_dec_tmp_i32, dW1_scales[layer], g_dec_x_scale, hidden, 0)) goto capture_fail;
+                if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dW3_i8[layer], g_dec_x_i8, 1, dim, hidden)) goto capture_fail;
+                if (!launch_i32_to_f32_row_scale(g_dec_up, g_dec_tmp_i32, dW3_scales[layer], g_dec_x_scale, hidden, 0)) goto capture_fail;
+                if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) goto capture_fail;
+                dGate = g_dec_gate;
+            }
 
-        if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) goto capture_fail;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2[layer], 1, hidden, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2[layer], 1, hidden, dim)) goto capture_fail;
-            if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) goto capture_fail;
+            if (!launch_f32_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, dGate, hidden)) goto capture_fail;
+            if (!gemm_t_i8_i8_i32(g_dec_tmp_i32, dW2_i8[layer], g_dec_x_i8, 1, hidden, dim)) goto capture_fail;
+            if (!launch_i32_to_f32_row_scale(g_dec_x, g_dec_tmp_i32, dW2_scales[layer], g_dec_x_scale, dim, 1)) goto capture_fail;
+        } else {
+            if (use_merge_ffn13) {
+                int n13 = 2 * hidden;
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13[layer], 1, dim, n13)) goto capture_fail;
+                dGate = g_dec_ffn13;
+                CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                if (!launch_silu_mul_inplace(dGate, dUp, hidden)) goto capture_fail;
+            } else {
+                if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1[layer], 1, dim, hidden)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3[layer], 1, dim, hidden)) goto capture_fail;
+                if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) goto capture_fail;
+            }
+
+            if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) goto capture_fail;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2[layer], 1, hidden, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2[layer], 1, hidden, dim)) goto capture_fail;
+                if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) goto capture_fail;
+            }
         }
     }
 
@@ -5966,11 +6572,12 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         else if (use_v3) attn = "v3";
         else if (use_v2 && have_v2) attn = "v2";
         const char *logits_s = (logits_mode == 2) ? "int8_fused" : (logits_mode == 1) ? "bf16_fused" : "matmul";
-        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s, logits=%s)\n",
+        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s%s, logits=%s)\n",
                 want_fp16 ? "fp16" : "fp32",
                 attn,
                 use_merge_qkv ? ", merge_qkv" : "",
                 use_merge_ffn13 ? ", merge_ffn13" : "",
+                use_dec_int8 ? ", dec_int8" : "",
                 use_rope_dev ? ", rope_dev" : "",
                 use_host_x ? ", host_x" : "",
                 use_host_pos ? ", host_pos" : "",
@@ -6144,6 +6751,8 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     int kv_dim = n_kv_heads * head_dim;
     int use_merge_qkv = merge_qkv_enabled();
     int use_merge_ffn13 = merge_ffn13_enabled();
+    int use_dec_int8 = (decoder_int8_enabled() &&
+                        g_fn_f32_vec_to_i8_scale && g_fn_bf16_vec_to_i8_scale && g_fn_i32_to_f32_row_scale);
 
     int pos = ctx->kv_cache_len;
     int total_seq = pos + 1;
@@ -6174,6 +6783,14 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     }
     if (use_merge_ffn13) {
         if (!ensure_buffer(&g_dec_ffn13, &g_cap_dec_ffn13, (size_t)(2 * hidden) * sizeof(float))) return 0;
+    }
+
+    if (use_dec_int8) {
+        /* Reuse g_dec_x_i8 for multiple stages (dim/q_dim/hidden); size to hidden. */
+        if (!ensure_buffer(&g_dec_x_i8, &g_cap_dec_x_i8, (size_t)hidden * sizeof(int8_t))) return 0;
+        if (!ensure_buffer(&g_dec_x_scale, &g_cap_dec_x_scale, sizeof(float))) return 0;
+        /* INT32 scratch holds the largest M=1 output (2*hidden for merged FFN13). */
+        if (!ensure_buffer(&g_dec_tmp_i32, &g_cap_dec_tmp_i32, (size_t)(2 * hidden) * sizeof(int32_t))) return 0;
     }
 
     CUresult r;
@@ -6210,28 +6827,70 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
         size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
         CUdeviceptr dQ = 0, dK = 0, dV = 0;
-        if (use_merge_qkv) {
-            CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                        l->wq_weight_bf16, bytes_wq,
-                                                        l->wk_weight_bf16, bytes_wkv,
-                                                        l->wv_weight_bf16, bytes_wkv);
-            if (!dWqkv) return 0;
-            int qkv_dim = q_dim + 2 * kv_dim;
-            if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv, 1, dim, qkv_dim)) return 0;
-            dQ = g_dec_qkv;
-            dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
-            dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
-        } else {
-            CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!dWq || !dWk || !dWv) return 0;
-            dQ = g_dec_q;
-            dK = g_dec_k;
-            dV = g_dec_v;
-            if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq, 1, dim, q_dim)) return 0;
-            if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk, 1, dim, kv_dim)) return 0;
-            if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv, 1, dim, kv_dim)) return 0;
+        if (use_dec_int8) {
+            int ok_i8 = 0;
+            if (use_merge_qkv) {
+                int qkv_out = q_dim + 2 * kv_dim;
+                i8_weight_t Wqkv = i8_cache_get_merged_3(l->wq_weight_bf16,
+                                                         l->wq_weight_bf16, q_dim,
+                                                         l->wk_weight_bf16, kv_dim,
+                                                         l->wv_weight_bf16, kv_dim,
+                                                         dim);
+                if (Wqkv.w_i8 && Wqkv.scales_f32 &&
+                    launch_bf16_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_x_bf16, dim) &&
+                    gemm_t_i8_i8_i32(g_dec_tmp_i32, Wqkv.w_i8, g_dec_x_i8, 1, dim, qkv_out) &&
+                    launch_i32_to_f32_row_scale(g_dec_qkv, g_dec_tmp_i32, Wqkv.scales_f32, g_dec_x_scale, qkv_out, 0)) {
+                    dQ = g_dec_qkv;
+                    dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                    dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+                    ok_i8 = 1;
+                }
+            } else {
+                i8_weight_t Wq = i8_cache_get_bf16(l->wq_weight_bf16, dim, q_dim);
+                i8_weight_t Wk = i8_cache_get_bf16(l->wk_weight_bf16, dim, kv_dim);
+                i8_weight_t Wv = i8_cache_get_bf16(l->wv_weight_bf16, dim, kv_dim);
+                if (Wq.w_i8 && Wq.scales_f32 &&
+                    Wk.w_i8 && Wk.scales_f32 &&
+                    Wv.w_i8 && Wv.scales_f32 &&
+                    launch_bf16_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_x_bf16, dim) &&
+                    gemm_t_i8_i8_i32(g_dec_tmp_i32, Wq.w_i8, g_dec_x_i8, 1, dim, q_dim) &&
+                    launch_i32_to_f32_row_scale(g_dec_q, g_dec_tmp_i32, Wq.scales_f32, g_dec_x_scale, q_dim, 0) &&
+                    gemm_t_i8_i8_i32(g_dec_tmp_i32, Wk.w_i8, g_dec_x_i8, 1, dim, kv_dim) &&
+                    launch_i32_to_f32_row_scale(g_dec_k, g_dec_tmp_i32, Wk.scales_f32, g_dec_x_scale, kv_dim, 0) &&
+                    gemm_t_i8_i8_i32(g_dec_tmp_i32, Wv.w_i8, g_dec_x_i8, 1, dim, kv_dim) &&
+                    launch_i32_to_f32_row_scale(g_dec_v, g_dec_tmp_i32, Wv.scales_f32, g_dec_x_scale, kv_dim, 0)) {
+                    dQ = g_dec_q;
+                    dK = g_dec_k;
+                    dV = g_dec_v;
+                    ok_i8 = 1;
+                }
+            }
+            if (!ok_i8) use_dec_int8 = 0;
+        }
+        if (!use_dec_int8) {
+            if (use_merge_qkv) {
+                CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                            l->wq_weight_bf16, bytes_wq,
+                                                            l->wk_weight_bf16, bytes_wkv,
+                                                            l->wv_weight_bf16, bytes_wkv);
+                if (!dWqkv) return 0;
+                int qkv_dim = q_dim + 2 * kv_dim;
+                if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv, 1, dim, qkv_dim)) return 0;
+                dQ = g_dec_qkv;
+                dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            } else {
+                CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!dWq || !dWk || !dWv) return 0;
+                dQ = g_dec_q;
+                dK = g_dec_k;
+                dV = g_dec_v;
+                if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq, 1, dim, q_dim)) return 0;
+                if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk, 1, dim, kv_dim)) return 0;
+                if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv, 1, dim, kv_dim)) return 0;
+            }
         }
 
         /* RoPE */
@@ -6246,12 +6905,25 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
 
         /* Output projection */
         size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
-        CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (!dWo) return 0;
-        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, 1, q_dim, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, 1, q_dim, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) return 0;
+        if (use_dec_int8) {
+            i8_weight_t Wo = i8_cache_get_bf16(l->wo_weight_bf16, q_dim, dim);
+            if (Wo.w_i8 && Wo.scales_f32 &&
+                launch_f32_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_attn, q_dim) &&
+                gemm_t_i8_i8_i32(g_dec_tmp_i32, Wo.w_i8, g_dec_x_i8, 1, q_dim, dim) &&
+                launch_i32_to_f32_row_scale(g_dec_x, g_dec_tmp_i32, Wo.scales_f32, g_dec_x_scale, dim, 1)) {
+                /* ok */
+            } else {
+                use_dec_int8 = 0;
+            }
+        }
+        if (!use_dec_int8) {
+            CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (!dWo) return 0;
+            if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, 1, q_dim, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, 1, q_dim, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) return 0;
+            }
         }
 
         /* FFN */
@@ -6272,33 +6944,80 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         }
 
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dGate = g_dec_gate;
-        if (use_merge_ffn13) {
-            CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                       l->w1_weight_bf16, bytes_w1,
-                                                       l->w3_weight_bf16, bytes_w1);
-            if (!dW13) return 0;
-            int n13 = 2 * hidden;
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13, 1, dim, n13)) return 0;
-            dGate = g_dec_ffn13;
-            CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
-            if (!launch_silu_mul_inplace(dGate, dUp, hidden)) return 0;
-        } else {
-            CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!dW1 || !dW3) return 0;
-            if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, 1, dim, hidden)) return 0;
-            if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, 1, dim, hidden)) return 0;
-            if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) return 0;
+        if (use_dec_int8) {
+            int ok_i8 = 1;
+
+            if (!launch_bf16_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, g_dec_x_bf16, dim)) ok_i8 = 0;
+
+            CUdeviceptr dGate = g_dec_gate;
+            if (ok_i8) {
+                if (use_merge_ffn13) {
+                    int n13 = 2 * hidden;
+                    i8_weight_t W13 = i8_cache_get_merged_2(l->w1_weight_bf16,
+                                                            l->w1_weight_bf16, hidden,
+                                                            l->w3_weight_bf16, hidden,
+                                                            dim);
+                    if (!W13.w_i8 || !W13.scales_f32) ok_i8 = 0;
+                    if (ok_i8 && !gemm_t_i8_i8_i32(g_dec_tmp_i32, W13.w_i8, g_dec_x_i8, 1, dim, n13)) ok_i8 = 0;
+                    if (ok_i8 && !launch_i32_to_f32_row_scale(g_dec_ffn13, g_dec_tmp_i32, W13.scales_f32, g_dec_x_scale, n13, 0)) ok_i8 = 0;
+                    if (ok_i8) {
+                        dGate = g_dec_ffn13;
+                        CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                        if (!launch_silu_mul_inplace(dGate, dUp, hidden)) ok_i8 = 0;
+                    }
+                } else {
+                    i8_weight_t W1 = i8_cache_get_bf16(l->w1_weight_bf16, dim, hidden);
+                    i8_weight_t W3 = i8_cache_get_bf16(l->w3_weight_bf16, dim, hidden);
+                    if (!W1.w_i8 || !W1.scales_f32 || !W3.w_i8 || !W3.scales_f32) ok_i8 = 0;
+                    if (ok_i8 && !gemm_t_i8_i8_i32(g_dec_tmp_i32, W1.w_i8, g_dec_x_i8, 1, dim, hidden)) ok_i8 = 0;
+                    if (ok_i8 && !launch_i32_to_f32_row_scale(g_dec_gate, g_dec_tmp_i32, W1.scales_f32, g_dec_x_scale, hidden, 0)) ok_i8 = 0;
+                    if (ok_i8 && !gemm_t_i8_i8_i32(g_dec_tmp_i32, W3.w_i8, g_dec_x_i8, 1, dim, hidden)) ok_i8 = 0;
+                    if (ok_i8 && !launch_i32_to_f32_row_scale(g_dec_up, g_dec_tmp_i32, W3.scales_f32, g_dec_x_scale, hidden, 0)) ok_i8 = 0;
+                    if (ok_i8 && !launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) ok_i8 = 0;
+                    dGate = g_dec_gate;
+                }
+            }
+
+            if (ok_i8) {
+                i8_weight_t W2 = i8_cache_get_bf16(l->w2_weight_bf16, hidden, dim);
+                if (!W2.w_i8 || !W2.scales_f32) ok_i8 = 0;
+                if (ok_i8 && !launch_f32_vec_to_i8_scale(g_dec_x_i8, g_dec_x_scale, dGate, hidden)) ok_i8 = 0;
+                if (ok_i8 && !gemm_t_i8_i8_i32(g_dec_tmp_i32, W2.w_i8, g_dec_x_i8, 1, hidden, dim)) ok_i8 = 0;
+                if (ok_i8 && !launch_i32_to_f32_row_scale(g_dec_x, g_dec_tmp_i32, W2.scales_f32, g_dec_x_scale, dim, 1)) ok_i8 = 0;
+            }
+
+            if (!ok_i8) use_dec_int8 = 0;
         }
 
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dW2) return 0;
-        if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, 1, hidden, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, 1, hidden, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) return 0;
+        if (!use_dec_int8) {
+            CUdeviceptr dGate = g_dec_gate;
+            if (use_merge_ffn13) {
+                CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                           l->w1_weight_bf16, bytes_w1,
+                                                           l->w3_weight_bf16, bytes_w1);
+                if (!dW13) return 0;
+                int n13 = 2 * hidden;
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13, 1, dim, n13)) return 0;
+                dGate = g_dec_ffn13;
+                CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                if (!launch_silu_mul_inplace(dGate, dUp, hidden)) return 0;
+            } else {
+                CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!dW1 || !dW3) return 0;
+                if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, 1, dim, hidden)) return 0;
+                if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, 1, dim, hidden)) return 0;
+                if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) return 0;
+            }
+
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dW2) return 0;
+            if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, 1, hidden, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, 1, hidden, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) return 0;
+            }
         }
     }
 
