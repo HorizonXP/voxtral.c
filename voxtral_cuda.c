@@ -2835,6 +2835,7 @@ static int vox_cuda_causal_attention_dev(CUdeviceptr dOut,
 
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
+    int need_expand = (n_heads != n_kv_heads);
 
     size_t bytes_q = (size_t)seq_q * (size_t)q_hidden * sizeof(float);
     size_t bytes_k = (size_t)seq_k * (size_t)kv_hidden * sizeof(float);
@@ -2847,8 +2848,10 @@ static int vox_cuda_causal_attention_dev(CUdeviceptr dOut,
     if (!ensure_buffer(&g_dQp_attn, &g_cap_qp_attn, bytes_q)) return 0;
     if (!ensure_buffer(&g_dKp_attn, &g_cap_kp_attn, bytes_k)) return 0;
     if (!ensure_buffer(&g_dVp_attn, &g_cap_vp_attn, bytes_v)) return 0;
-    if (!ensure_buffer(&g_dKfull_attn, &g_cap_kfull_attn, bytes_kfull)) return 0;
-    if (!ensure_buffer(&g_dVfull_attn, &g_cap_vfull_attn, bytes_vfull)) return 0;
+    if (need_expand) {
+        if (!ensure_buffer(&g_dKfull_attn, &g_cap_kfull_attn, bytes_kfull)) return 0;
+        if (!ensure_buffer(&g_dVfull_attn, &g_cap_vfull_attn, bytes_vfull)) return 0;
+    }
     if (!ensure_buffer(&g_dScores_attn, &g_cap_scores_attn, bytes_scores)) return 0;
     if (!ensure_buffer(&g_dOutPacked_attn, &g_cap_outpacked_attn, bytes_out)) return 0;
 
@@ -2872,16 +2875,22 @@ static int vox_cuda_causal_attention_dev(CUdeviceptr dOut,
     r = cuLaunchKernel(g_fn_pack_heads, blocks_kv, 1, 1, threads, 1, 1, 0, g_stream, pack_v_params, NULL);
     if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(pack_V_dev)", r); return 0; }
 
-    /* Expand KV heads to per-query-head layout for strided-batched GEMMs. */
-    int total_kfull = seq_k * n_heads * head_dim;
-    int blocks_kfull = (total_kfull + threads - 1) / threads;
-    void *expand_k_params[] = { &g_dKfull_attn, &g_dKp_attn, &seq_k, &n_heads, &n_kv_heads, &head_dim };
-    r = cuLaunchKernel(g_fn_expand_kv_heads, blocks_kfull, 1, 1, threads, 1, 1, 0, g_stream, expand_k_params, NULL);
-    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(expand_K_dev)", r); return 0; }
+    CUdeviceptr dKfull = g_dKp_attn;
+    CUdeviceptr dVfull = g_dVp_attn;
+    if (need_expand) {
+        /* Expand KV heads to per-query-head layout for strided-batched GEMMs. */
+        int total_kfull = seq_k * n_heads * head_dim;
+        int blocks_kfull = (total_kfull + threads - 1) / threads;
+        void *expand_k_params[] = { &g_dKfull_attn, &g_dKp_attn, &seq_k, &n_heads, &n_kv_heads, &head_dim };
+        r = cuLaunchKernel(g_fn_expand_kv_heads, blocks_kfull, 1, 1, threads, 1, 1, 0, g_stream, expand_k_params, NULL);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(expand_K_dev)", r); return 0; }
 
-    void *expand_v_params[] = { &g_dVfull_attn, &g_dVp_attn, &seq_k, &n_heads, &n_kv_heads, &head_dim };
-    r = cuLaunchKernel(g_fn_expand_kv_heads, blocks_kfull, 1, 1, threads, 1, 1, 0, g_stream, expand_v_params, NULL);
-    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(expand_V_dev)", r); return 0; }
+        void *expand_v_params[] = { &g_dVfull_attn, &g_dVp_attn, &seq_k, &n_heads, &n_kv_heads, &head_dim };
+        r = cuLaunchKernel(g_fn_expand_kv_heads, blocks_kfull, 1, 1, threads, 1, 1, 0, g_stream, expand_v_params, NULL);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(expand_V_dev)", r); return 0; }
+        dKfull = g_dKfull_attn;
+        dVfull = g_dVfull_attn;
+    }
 
     /* 1) scores_h = Q_h @ K_h^T  (scaled) */
     const float alpha0 = scale;
@@ -2894,7 +2903,7 @@ static int vox_cuda_causal_attention_dev(CUdeviceptr dOut,
         CUBLAS_OP_T, CUBLAS_OP_N,
         seq_k, seq_q, head_dim,
         &alpha0,
-        (const float *)(uintptr_t)g_dKfull_attn, head_dim, strideA0,
+        (const float *)(uintptr_t)dKfull, head_dim, strideA0,
         (const float *)(uintptr_t)g_dQp_attn, head_dim, strideB0,
         &beta0,
         (float *)(uintptr_t)g_dScores_attn, seq_k, strideC0,
@@ -2920,7 +2929,7 @@ static int vox_cuda_causal_attention_dev(CUdeviceptr dOut,
         CUBLAS_OP_N, CUBLAS_OP_N,
         head_dim, seq_q, seq_k,
         &alpha1,
-        (const float *)(uintptr_t)g_dVfull_attn, head_dim, strideA1,
+        (const float *)(uintptr_t)dVfull, head_dim, strideA1,
         (const float *)(uintptr_t)g_dScores_attn, seq_k, strideB1,
         &beta1,
         (float *)(uintptr_t)g_dOutPacked_attn, head_dim, strideC1,
