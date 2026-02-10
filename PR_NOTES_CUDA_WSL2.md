@@ -227,12 +227,18 @@ VOX_CUDA_CONV_STEM=1
 
 This runs the encoder conv stem (conv0/conv1 + GELU) on GPU via custom CUDA kernels + cuBLAS SGEMM (no cuDNN). It mainly reduces CPU-side `im2col` overhead in the encoder front-end.
 
-### Full CUDA Streaming Pipeline (opt-in)
+### Full CUDA Streaming Pipeline (fast default)
 
 Enable with:
 
 ```bash
 VOX_CUDA_PIPELINE_FULL=1
+```
+
+This is also enabled by default under `VOX_CUDA_FAST=1` (best-effort). Disable with:
+
+```bash
+VOX_CUDA_PIPELINE_FULL=0
 ```
 
 This keeps streaming adapter embeddings on-device and lets CUDA build the per-step decoder input embedding directly from the device-side adapter buffer:
@@ -248,6 +254,7 @@ Notes:
 
 Related env vars:
 - `VOX_DISABLE_CUDA_PIPELINE_FULL=1` disables the pipeline.
+- `VOX_CUDA_PIPELINE_FULL=0/1` explicitly disables/enables the pipeline (overrides `VOX_CUDA_FAST` default).
 - `VOX_CUDA_ADAPTER_CAP_TOKENS=<int>` sets the initial adapter buffer capacity (default: 8192).
 
 ### `samples/I_have_a_dream.ogg` (180s)

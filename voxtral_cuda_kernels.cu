@@ -2551,6 +2551,24 @@ extern "C" __global__ void vox_step_embed_from_adapter_f32(float *dst,
     dst[idx] = a[idx] + tf;
 }
 
+/* Same as vox_step_embed_from_adapter_f32, but token_id and adapter_slot are
+ * read from device scalars. This is used to make the kernel CUDA-Graph friendly. */
+extern "C" __global__ void vox_step_embed_from_adapter_dyn_f32(float *dst,
+                                                               const float *adapter,
+                                                               const uint16_t *tok_emb_bf16,
+                                                               const int *token_id_dev,
+                                                               const int *adapter_slot_dev,
+                                                               int dim) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= dim) return;
+    int token_id = *token_id_dev;
+    int adapter_slot = *adapter_slot_dev;
+    const float *a = adapter + (size_t)adapter_slot * (size_t)dim;
+    const uint16_t *t = tok_emb_bf16 + (size_t)token_id * (size_t)dim;
+    float tf = __uint_as_float(((uint32_t)t[idx]) << 16);
+    dst[idx] = a[idx] + tf;
+}
+
 extern "C" __global__ void vox_downsample4_concat_f32(float *dst,
                                                       const float *src,
                                                       int start,

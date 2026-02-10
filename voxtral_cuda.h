@@ -84,8 +84,11 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
                             int overlap_mel);
 
 /* Optional: full CUDA streaming pipeline (encoder+adapter outputs kept on
- * device, decoder consumes adapter embeddings directly). Opt-in via
- * VOX_CUDA_PIPELINE_FULL=1. */
+ * device, decoder consumes adapter embeddings directly).
+ *
+ * Default on under VOX_CUDA_FAST=1 (best-effort). You can also force it with
+ * VOX_CUDA_PIPELINE_FULL=1, or disable it with VOX_CUDA_PIPELINE_FULL=0 (or
+ * VOX_DISABLE_CUDA_PIPELINE_FULL=1). */
 void vox_cuda_stream_adapter_reset(vox_ctx_t *ctx);
 
 /* Copy the first `n_tokens` adapter embeddings from the device-side adapter
