@@ -150,12 +150,16 @@ On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a
 
 When CUDA Graphs are enabled, v3 is auto-selected for the graph capture path if available (unless disabled via `VOX_DISABLE_CUDA_ATTN_V3=1`).
 
-### Attention v5 (opt-in)
+### Attention v5 (default under `VOX_CUDA_FAST=1`)
 
-Enable with:
+v5 is enabled by default when `VOX_CUDA_FAST=1` (best-effort; can be disabled).
+
+Force-enable/disable with:
 
 ```bash
-VOX_CUDA_ATTN_V5=1
+VOX_CUDA_ATTN_V5=1          # force on
+VOX_CUDA_ATTN_V5=0          # force off (falls back to v4/v3)
+VOX_DISABLE_CUDA_ATTN_V5=1  # hard-disable
 ```
 
 Notes:
@@ -166,8 +170,8 @@ Notes:
 
 On `/tmp/vox_iad.wav` (~180s WAV) with `VOX_CUDA_FAST=1`:
 
-- Baseline (v4): `Wall transcribe 33470 ms`, decoder `13.1 ms/step`
-- With v5: `Wall transcribe 33037 ms`, decoder `12.9 ms/step`
+- Default (v5): `Wall transcribe 31953 ms`, decoder `13.0 ms/step`
+- Force v4 (disable v5): `Wall transcribe 32934 ms`, decoder `13.6 ms/step`
 
 ### Merged Decoder Projections (opt-in)
 

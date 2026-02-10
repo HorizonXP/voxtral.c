@@ -115,7 +115,7 @@ if [[ "${VOX_BENCH_CUDA_OPTS:-0}" == "1" ]]; then
   run_case cuda "cuda+graphs" VOX_CUDA_GRAPHS=1
   run_case cuda "cuda+attn_v3" VOX_CUDA_ATTN_V3=1
   run_case cuda "cuda+graphs+attn_v3" VOX_CUDA_GRAPHS=1 VOX_CUDA_ATTN_V3=1
-  run_case cuda "cuda+fast+attn_v5" VOX_CUDA_FAST=1 VOX_CUDA_ATTN_V5=1
+  run_case cuda "cuda+fast+no_attn_v5" VOX_CUDA_FAST=1 VOX_DISABLE_CUDA_ATTN_V5=1
   run_case cuda "cuda+merged_weights" VOX_CUDA_MERGE_WEIGHTS=1
   run_case cuda "cuda+graphs+merged_weights" VOX_CUDA_GRAPHS=1 VOX_CUDA_MERGE_WEIGHTS=1
   run_case cuda "cuda+graphs+merged_weights+rope_dev" VOX_CUDA_GRAPHS=1 VOX_CUDA_MERGE_WEIGHTS=1 VOX_CUDA_ROPE_DEV=1

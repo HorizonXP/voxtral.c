@@ -410,9 +410,9 @@ VOX_CUDA_FAST=1 ./voxtral -d voxtral-model -i samples/test_speech.wav
 
 Notes:
 - `VOX_CUDA_FAST=1` enables a fused top1-only logits path by default when alternatives are disabled (`--alt` not used). Disable it with `VOX_DISABLE_CUDA_LOGITS_FUSED=1` if you want to benchmark the baseline logits+argmax path.
-- `VOX_CUDA_FAST=1` also enables the chunked attention v4 path by default (fused KV append into the v3 partial kernel, best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V4=1`.
+- `VOX_CUDA_FAST=1` also enables the chunked attention v5 path by default (skips inactive chunks; best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V5=1` (or force it with `VOX_CUDA_ATTN_V5=0/1`).
+- `VOX_CUDA_FAST=1` also enables the chunked attention v4 path by default as a fallback when v5 is unavailable/disabled (fused KV append into the v3 partial kernel, best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V4=1`.
 - `VOX_CUDA_FAST=1` also enables the full CUDA streaming pipeline by default (keeps adapter embeddings on-device and builds step embeddings on GPU). Disable it with `VOX_CUDA_PIPELINE_FULL=0` (or `VOX_DISABLE_CUDA_PIPELINE_FULL=1`).
-- `VOX_CUDA_ATTN_V5=1` enables an experimental decoder attention variant that skips inactive chunks (best-effort; default off until validated broadly).
 - `VOX_CUDA_FAST=1` also enables cuBLASLt autotune for the `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`.
 - `VOX_CUDA_FAST=1` also enables a cuBLASLt “transpose-B view” for `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1` (or force it with `VOX_CUDA_CUBLASLT_TRANSPOSE_B=0/1`).
 - `VOX_CUDA_CUBLASLT_MAX_WS_MB=auto|<MB>` controls the *max* cuBLASLt workspace allowed for heuristic selection (can unlock faster `M=1` kernels at the cost of some persistent VRAM). Default is modest; `VOX_CUDA_FAST=1` biases it higher automatically.
