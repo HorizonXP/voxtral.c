@@ -1308,6 +1308,30 @@ static void bf16_cache_init_limit(void) {
         size_t extra = (size_t)512 * 1024 * 1024; /* fragmentation + other buffers */
         size_t reserve = kv_bytes + extra;
 
+        if (decoder_int8_enabled()) {
+            /* Reserve VRAM for the optional decoder INT8 weight cache (QKV/WO/FFN).
+             * This avoids near-OOM behavior that can force very slow GEMM algos. */
+            int dim = VOX_DEC_DIM;
+            int hidden = VOX_DEC_HIDDEN;
+            int q_dim = VOX_DEC_HEADS * VOX_DEC_HEAD_DIM;
+            int kv_rows = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 1024 */
+            size_t qkv_rows = (size_t)q_dim + 2 * (size_t)kv_rows;
+            size_t wo_rows = (size_t)dim;
+            size_t ffn13_rows = 2 * (size_t)hidden;
+            size_t w2_rows = (size_t)dim;
+
+            size_t bytes_w = (qkv_rows * (size_t)dim +
+                              wo_rows * (size_t)q_dim +
+                              ffn13_rows * (size_t)dim +
+                              w2_rows * (size_t)hidden) * (size_t)VOX_DEC_LAYERS;
+            size_t bytes_s = (qkv_rows + wo_rows + ffn13_rows + w2_rows) *
+                             sizeof(float) * (size_t)VOX_DEC_LAYERS;
+            size_t pad = (size_t)VOX_DEC_LAYERS * 4 * 256; /* per-entry align-up to 256B */
+            size_t i8_bytes = bytes_w + bytes_s + pad;
+            size_t i8_extra = (size_t)256 * 1024 * 1024;
+            reserve += i8_bytes + i8_extra;
+        }
+
         size_t cap = (free_b > reserve) ? (free_b - reserve) : (free_b * 8 / 10);
         /* Avoid trying to consume essentially all VRAM; keep a safety margin. */
         size_t max_frac = (total_b * 9) / 10; /* 90% of total */
