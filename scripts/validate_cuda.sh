@@ -24,6 +24,12 @@ printf "[ok] CUDA smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_smoke.tx
 VOX_CUDA_FAST=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_smoke.txt
 printf "[ok] CUDA fast smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_smoke.txt)"
 
+# Optional: experimental attention v6 smoke (FP16 partials). Enable with: VOX_VALIDATE_ATTN_V6=1
+if [[ "${VOX_VALIDATE_ATTN_V6:-0}" != "0" ]]; then
+  VOX_CUDA_FAST=1 VOX_CUDA_ATTN_V6=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_attn_v6_smoke.txt
+  printf "[ok] CUDA fast (attn v6) smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_attn_v6_smoke.txt)"
+fi
+
 # Fast with attention v5 disabled (should still run; falls back to v4/v3).
 VOX_CUDA_FAST=1 VOX_DISABLE_CUDA_ATTN_V5=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_fast_noattn5_smoke.txt
 printf "[ok] CUDA fast (no attn v5) smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_fast_noattn5_smoke.txt)"
