@@ -104,6 +104,7 @@ run_case cuda cuda
 if [[ "${VOX_BENCH_CUDA_OPTS:-0}" == "1" ]]; then
   echo "== extra CUDA variants (VOX_BENCH_CUDA_OPTS=1) =="
   run_case cuda "cuda+fast" VOX_CUDA_FAST=1
+  run_case cuda "cuda+fast+attn_v6" VOX_CUDA_FAST=1 VOX_CUDA_ATTN_V6=1
   run_case cuda "cuda+fast+no_pipeline" VOX_CUDA_FAST=1 VOX_CUDA_PIPELINE_FULL=0
   run_case cuda "cuda+fast+logits_int8" VOX_CUDA_FAST=1 VOX_CUDA_LOGITS_INT8=1
   # cuBLASLt workspace cap can materially change algo selection for M=1 decoder GEMMs.

@@ -173,6 +173,24 @@ On `/tmp/vox_iad.wav` (~180s WAV) with `VOX_CUDA_FAST=1`:
 - Default (v5): `Wall transcribe 31953 ms`, decoder `13.0 ms/step`
 - Force v4 (disable v5): `Wall transcribe 32934 ms`, decoder `13.6 ms/step`
 
+### Attention v6 (opt-in; FP16 partials)
+
+Enable with:
+
+```bash
+VOX_CUDA_ATTN_V6=1
+```
+
+Notes:
+- v6 is implemented for FP16 KV cache only (`VOX_CUDA_KV_FP16=1`, which is the default).
+- v6 stores `out_part` in FP16 (instead of FP32) to reduce global memory traffic. This may change outputs slightly; validate with `./scripts/accuracy_regression.sh`.
+- On the RTX 3080 Ti (WSL2) this did not materially improve wall-clock for `/tmp/vox_iad.wav`, so it remains opt-in for now.
+
+On `/tmp/vox_iad.wav` (~180s WAV) with `VOX_CUDA_FAST=1`:
+
+- Default (v5): `Wall transcribe 31953 ms`, decoder `13.0 ms/step`
+- v6 (`VOX_CUDA_ATTN_V6=1`): `Wall transcribe 32252 ms`, decoder `13.2 ms/step`
+
 ### Merged Decoder Projections (opt-in)
 
 Enable with:
