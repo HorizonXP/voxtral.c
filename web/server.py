@@ -129,6 +129,29 @@ async def _run_ffmpeg_to_wav(in_path: str, out_path: str) -> Tuple[int, bytes]:
     return proc.returncode, err or b""
 
 
+async def _run_ffmpeg_to_pcm16le_16k_mono(in_path: str) -> Tuple[int, bytes, bytes]:
+    # Decode any input format ffmpeg supports to raw PCM16LE @16kHz mono on stdout.
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        in_path,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "s16le",
+        "-",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    return proc.returncode, out or b"", err or b""
+
 def _write_silence_wav_16k_mono(path: str, *, seconds: float = 1.0) -> None:
     n = int(max(0.0, seconds) * 16000)
     # 16-bit PCM little-endian, mono, 16kHz.
@@ -140,7 +163,27 @@ def _write_silence_wav_16k_mono(path: str, *, seconds: float = 1.0) -> None:
         wf.writeframes(pcm)
 
 
-def _format_transcription_response(*, text: str, response_format: str) -> web.StreamResponse:
+def _try_read_wav_pcm16le_16k_mono(path: str) -> Optional[bytes]:
+    # Fast-path: avoid spawning ffmpeg if the upload is already the right WAV format.
+    try:
+        with wave.open(path, "rb") as wf:
+            if wf.getnchannels() != 1:
+                return None
+            if wf.getsampwidth() != 2:
+                return None
+            if wf.getframerate() != 16000:
+                return None
+            return wf.readframes(wf.getnframes())
+    except Exception:
+        return None
+
+
+def _format_transcription_response(
+    *,
+    text: str,
+    response_format: str,
+    timings_ms: Optional[Dict[str, float]] = None,
+) -> web.StreamResponse:
     text = (text or "").strip()
 
     if response_format == "text":
@@ -149,13 +192,14 @@ def _format_transcription_response(*, text: str, response_format: str) -> web.St
         return web.json_response({"text": text})
     if response_format == "verbose_json":
         # Minimal "verbose" response for compatibility.
-        return web.json_response(
-            {
-                "task": "transcribe",
-                "text": text,
-                "segments": [],
-            }
-        )
+        payload = {
+            "task": "transcribe",
+            "text": text,
+            "segments": [],
+        }
+        if timings_ms:
+            payload["timings_ms"] = timings_ms
+        return web.json_response(payload)
 
     raise web.HTTPBadRequest(
         text="Unsupported response_format (use: json|text|verbose_json)\n",
@@ -260,20 +304,11 @@ class BatchWorker:
                 self._stderr_task.cancel()
             self._stderr_task = None
 
-    async def transcribe(self, *, wav_path: str, timeout_s: float) -> str:
+    async def _read_reply(self, *, req_id: int, timeout_s: float) -> str:
         if self._proc is None or self._proc.returncode is not None:
             raise BatchWorkerError("worker not running")
-        if self._proc.stdin is None or self._proc.stdout is None:
+        if self._proc.stdout is None:
             raise BatchWorkerError("worker pipes unavailable")
-
-        self._next_id += 1
-        req_id = self._next_id
-        cmd = f"T\t{req_id}\t{wav_path}\n".encode("utf-8", errors="strict")
-        try:
-            self._proc.stdin.write(cmd)
-            await self._proc.stdin.drain()
-        except Exception as e:
-            raise BatchWorkerError(f"failed to write request to worker: {e}") from e
 
         try:
             while True:
@@ -307,6 +342,45 @@ class BatchWorker:
             raise BatchWorkerError(
                 f"timeout waiting for worker response ({timeout_s}s)"
             ) from e
+
+    async def transcribe(self, *, wav_path: str, timeout_s: float) -> str:
+        if self._proc is None or self._proc.returncode is not None:
+            raise BatchWorkerError("worker not running")
+        if self._proc.stdin is None:
+            raise BatchWorkerError("worker pipes unavailable")
+
+        self._next_id += 1
+        req_id = self._next_id
+        cmd = f"T\t{req_id}\t{wav_path}\n".encode("utf-8", errors="strict")
+        try:
+            self._proc.stdin.write(cmd)
+            await self._proc.stdin.drain()
+        except Exception as e:
+            raise BatchWorkerError(f"failed to write request to worker: {e}") from e
+
+        return await self._read_reply(req_id=req_id, timeout_s=timeout_s)
+
+    async def transcribe_pcm16le_16k_mono(self, *, pcm: bytes, timeout_s: float) -> str:
+        if self._proc is None or self._proc.returncode is not None:
+            raise BatchWorkerError("worker not running")
+        if self._proc.stdin is None:
+            raise BatchWorkerError("worker pipes unavailable")
+
+        if (len(pcm) & 1) != 0:
+            raise BatchWorkerError("pcm payload must be an even number of bytes")
+
+        self._next_id += 1
+        req_id = self._next_id
+        header = f"P\t{req_id}\t{len(pcm)}\n".encode("utf-8", errors="strict")
+        try:
+            self._proc.stdin.write(header)
+            if pcm:
+                self._proc.stdin.write(pcm)
+            await self._proc.stdin.drain()
+        except Exception as e:
+            raise BatchWorkerError(f"failed to write request to worker: {e}") from e
+
+        return await self._read_reply(req_id=req_id, timeout_s=timeout_s)
 
 
 class BatchWorkerPool:
@@ -348,6 +422,18 @@ class BatchWorkerPool:
                 await w.close()
                 await w.start()
             return await w.transcribe(wav_path=wav_path, timeout_s=self._cfg.batch_timeout_s)
+        finally:
+            self._q.put_nowait(w)
+
+    async def transcribe_pcm16le_16k_mono(self, *, pcm: bytes) -> str:
+        if not self._workers:
+            raise BatchWorkerError("batch workers disabled")
+        w = await self._q.get()
+        try:
+            if not w.alive:
+                await w.close()
+                await w.start()
+            return await w.transcribe_pcm16le_16k_mono(pcm=pcm, timeout_s=self._cfg.batch_timeout_s)
         finally:
             self._q.put_nowait(w)
 
@@ -425,6 +511,7 @@ async def handle_transcriptions(request: web.Request) -> web.StreamResponse:
     response_format = "json"
 
     with tempfile.TemporaryDirectory(prefix="voxtral_upload_") as td:
+        t0 = time.perf_counter()
         td_path = pathlib.Path(td)
         async for part in reader:
             if part.name == "file":
@@ -448,28 +535,76 @@ async def handle_transcriptions(request: web.Request) -> web.StreamResponse:
                 text="Missing form field: file\n", content_type="text/plain"
             )
 
-        wav_path = str(td_path / "audio_16k_mono.wav")
-        rc, err = await _run_ffmpeg_to_wav(uploaded_path, wav_path)
-        if rc != 0:
-            raise web.HTTPBadRequest(
-                text=f"ffmpeg decode failed:\n{err.decode('utf-8', errors='replace')}\n",
-                content_type="text/plain",
-            )
+        t_upload_done = time.perf_counter()
 
         # Batch path: prefer the hot worker pool (keeps model loaded across requests).
         pool: Optional[BatchWorkerPool] = request.app.get("batch_pool")
+        audio_sec = 0.0
         if pool is not None and cfg.batch_workers > 0:
+            # Decode to raw PCM16LE @16kHz mono, then send to the persistent worker.
+            pcm = _try_read_wav_pcm16le_16k_mono(uploaded_path)
+            if pcm is None:
+                rc, pcm, err = await _run_ffmpeg_to_pcm16le_16k_mono(uploaded_path)
+                if rc != 0:
+                    raise web.HTTPBadRequest(
+                        text=f"ffmpeg decode failed:\n{err.decode('utf-8', errors='replace')}\n",
+                        content_type="text/plain",
+                    )
+
+            t_decode_done = time.perf_counter()
+            audio_sec = len(pcm) / (2.0 * 16000.0) if pcm else 0.0
+
             try:
-                text = await pool.transcribe(wav_path=wav_path)
+                text = await pool.transcribe_pcm16le_16k_mono(pcm=pcm)
             except BatchWorkerError as e:
                 raise web.HTTPInternalServerError(
                     text=f"batch worker failed: {e}\n",
                     content_type="text/plain",
                 )
         else:
-            text = await _run_voxtral_file(cfg=cfg, wav_path=wav_path, timeout_s=cfg.batch_timeout_s)
+            # Fallback (no persistent workers): decode to WAV then spawn `./voxtral -i`.
+            wav_path = str(td_path / "audio_16k_mono.wav")
+            rc, err = await _run_ffmpeg_to_wav(uploaded_path, wav_path)
+            if rc != 0:
+                raise web.HTTPBadRequest(
+                    text=f"ffmpeg decode failed:\n{err.decode('utf-8', errors='replace')}\n",
+                    content_type="text/plain",
+                )
+            t_decode_done = time.perf_counter()
+            try:
+                with wave.open(wav_path, "rb") as wf:
+                    audio_sec = wf.getnframes() / float(wf.getframerate() or 1)
+            except Exception:
+                audio_sec = 0.0
 
-        return _format_transcription_response(text=text, response_format=response_format)
+            text = await _run_voxtral_file(
+                cfg=cfg, wav_path=wav_path, timeout_s=cfg.batch_timeout_s
+            )
+
+        t_infer_done = time.perf_counter()
+
+        timings_ms = {
+            "upload_ms": (t_upload_done - t0) * 1000.0,
+            "decode_ms": (t_decode_done - t_upload_done) * 1000.0,
+            "infer_ms": (t_infer_done - t_decode_done) * 1000.0,
+            "total_ms": (t_infer_done - t0) * 1000.0,
+        }
+
+        resp = _format_transcription_response(
+            text=text,
+            response_format=response_format,
+            timings_ms=timings_ms,
+        )
+        # Non-invasive timing info for scripts.
+        resp.headers["X-Voxtral-Upload-Ms"] = f"{timings_ms['upload_ms']:.3f}"
+        resp.headers["X-Voxtral-Decode-Ms"] = f"{timings_ms['decode_ms']:.3f}"
+        resp.headers["X-Voxtral-Infer-Ms"] = f"{timings_ms['infer_ms']:.3f}"
+        resp.headers["X-Voxtral-Total-Ms"] = f"{timings_ms['total_ms']:.3f}"
+        resp.headers["X-Voxtral-Audio-Sec"] = f"{audio_sec:.6f}"
+        if audio_sec > 0.0 and timings_ms["infer_ms"] > 0.0:
+            xrt = audio_sec / (timings_ms["infer_ms"] / 1000.0)
+            resp.headers["X-Voxtral-xRT"] = f"{xrt:.3f}"
+        return resp
 
 
 async def handle_ws_realtime(request: web.Request) -> web.StreamResponse:
@@ -811,15 +946,13 @@ def main() -> int:
             await pool.start()
             if cfg.batch_warmup:
                 print(f"warming up {cfg.batch_workers} batch worker(s)...")
-                with tempfile.TemporaryDirectory(prefix="voxtral_warmup_") as td:
-                    wav_path = str(pathlib.Path(td) / "silence_1s.wav")
-                    _write_silence_wav_16k_mono(wav_path, seconds=1.0)
-                    for _ in range(cfg.batch_workers):
-                        try:
-                            await pool.transcribe(wav_path=wav_path)
-                        except Exception as e:
-                            print(f"warmup failed: {e}")
-                            break
+                pcm = b"\x00\x00" * 16000  # 1 second of silence (PCM16LE @16kHz mono)
+                for _ in range(cfg.batch_workers):
+                    try:
+                        await pool.transcribe_pcm16le_16k_mono(pcm=pcm)
+                    except Exception as e:
+                        print(f"warmup failed: {e}")
+                        break
 
     async def _on_cleanup(app: web.Application) -> None:
         pool: BatchWorkerPool = app["batch_pool"]

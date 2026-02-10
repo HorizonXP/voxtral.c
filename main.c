@@ -19,6 +19,7 @@
 #include <string.h>
 #include <signal.h>
 #include <math.h>
+#include <ctype.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
@@ -54,6 +55,17 @@ static void sanitize_single_line(char *s) {
         if (*p == '\n' || *p == '\r' || *p == '\t')
             *p = ' ';
     }
+}
+
+static void trim_ascii_whitespace_local(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    size_t start = 0;
+    while (start < len && isspace((unsigned char)s[start])) start++;
+    size_t end = len;
+    while (end > start && isspace((unsigned char)s[end - 1])) end--;
+    if (start > 0) memmove(s, s + start, end - start);
+    s[end - start] = '\0';
 }
 
 static void drain_tokens(vox_stream_t *s) {
@@ -232,6 +244,7 @@ int main(int argc, char **argv) {
          * stdin requests:
          *   READY\n                              (worker -> client, once at startup)
          *   T\t<id>\t<wav_path>\n                (client -> worker)
+         *   P\t<id>\t<nbytes>\n<pcm...>          (client -> worker, raw s16le 16kHz mono)
          *   Q\n                                  (client -> worker)
          *
          * stdout responses:
@@ -256,35 +269,140 @@ int main(int argc, char **argv) {
             if (strcmp(line, "Q") == 0 || strcmp(line, "QUIT") == 0)
                 break;
 
-            if (line[0] != 'T') {
+            if (line[0] != 'T' && line[0] != 'P') {
                 continue;
             }
 
-            /* Parse tab-delimited: T \t id \t path */
+            /* Parse tab-delimited: <cmd> \t id \t ... */
             char *saveptr = NULL;
             char *tok = strtok_r(line, "\t", &saveptr);
-            if (!tok || strcmp(tok, "T") != 0) {
+            if (!tok || (strcmp(tok, "T") != 0 && strcmp(tok, "P") != 0)) {
                 continue;
             }
             char *id_s = strtok_r(NULL, "\t", &saveptr);
-            char *path = strtok_r(NULL, "\t", &saveptr);
             long id = id_s ? strtol(id_s, NULL, 10) : -1;
-            if (!path || path[0] == '\0') {
-                fprintf(stdout, "R\t%ld\tERR\tmissing path\n", id);
-                fflush(stdout);
-                continue;
-            }
 
-            char *text = vox_transcribe(ctx, path);
-            if (!text) {
-                fprintf(stdout, "R\t%ld\tERR\ttranscription failed\n", id);
+            if (strcmp(tok, "T") == 0) {
+                char *path = strtok_r(NULL, "\t", &saveptr);
+                if (!path || path[0] == '\0') {
+                    fprintf(stdout, "R\t%ld\tERR\tmissing path\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+
+                char *text = vox_transcribe(ctx, path);
+                if (!text) {
+                    fprintf(stdout, "R\t%ld\tERR\ttranscription failed\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+                sanitize_single_line(text);
+                fprintf(stdout, "R\t%ld\tOK\t%s\n", id, text);
                 fflush(stdout);
-                continue;
+                free(text);
+            } else {
+                /* Raw PCM16LE 16kHz mono payload follows the line */
+                char *nbytes_s = strtok_r(NULL, "\t", &saveptr);
+                if (!nbytes_s || !nbytes_s[0]) {
+                    fprintf(stdout, "R\t%ld\tERR\tmissing nbytes\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+                char *end = NULL;
+                long long nbytes_ll = strtoll(nbytes_s, &end, 10);
+                if (end == nbytes_s || nbytes_ll < 0) {
+                    fprintf(stdout, "R\t%ld\tERR\tinvalid nbytes\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+                size_t nbytes = (size_t)nbytes_ll;
+                if ((nbytes & 1u) != 0u) {
+                    fprintf(stdout, "R\t%ld\tERR\tnbytes must be even\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+                if (nbytes > (size_t)1024 * 1024 * 1024) {
+                    fprintf(stdout, "R\t%ld\tERR\tpayload too large\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+
+                vox_stream_t *ws = vox_stream_init(ctx);
+                if (!ws) {
+                    fprintf(stdout, "R\t%ld\tERR\tfailed to init stream\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+
+                int16_t raw_buf[4096];
+                float fbuf[4096];
+                size_t remaining = nbytes;
+                int ok = 1;
+                while (remaining > 0) {
+                    size_t want = remaining;
+                    if (want > sizeof(raw_buf)) want = sizeof(raw_buf);
+                    size_t got = fread(raw_buf, 1, want, stdin);
+                    if (got != want) { ok = 0; break; }
+                    remaining -= got;
+                    size_t nsamp = got / 2;
+                    for (size_t i = 0; i < nsamp; i++)
+                        fbuf[i] = raw_buf[i] / 32768.0f;
+                    vox_stream_feed(ws, fbuf, (int)nsamp);
+                }
+
+                if (!ok) {
+                    vox_stream_free(ws);
+                    fprintf(stdout, "R\t%ld\tERR\tshort read\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+
+                vox_stream_finish(ws);
+
+                /* Collect tokens into a single string */
+                size_t text_cap = 1024;
+                size_t text_len = 0;
+                char *text = (char *)malloc(text_cap);
+                if (!text) {
+                    vox_stream_free(ws);
+                    fprintf(stdout, "R\t%ld\tERR\tout of memory\n", id);
+                    fflush(stdout);
+                    continue;
+                }
+                text[0] = '\0';
+
+                const char *tokens[64];
+                int tn;
+                while ((tn = vox_stream_get(ws, tokens, 64)) > 0) {
+                    for (int i = 0; i < tn; i++) {
+                        size_t piece_len = strlen(tokens[i]);
+                        if (text_len + piece_len + 1 > text_cap) {
+                            while (text_len + piece_len + 1 > text_cap) text_cap *= 2;
+                            char *tmp = (char *)realloc(text, text_cap);
+                            if (!tmp) {
+                                free(text);
+                                vox_stream_free(ws);
+                                fprintf(stdout, "R\t%ld\tERR\tout of memory\n", id);
+                                fflush(stdout);
+                                goto next_worker_req;
+                            }
+                            text = tmp;
+                        }
+                        memcpy(text + text_len, tokens[i], piece_len);
+                        text_len += piece_len;
+                        text[text_len] = '\0';
+                    }
+                }
+
+                vox_stream_free(ws);
+                trim_ascii_whitespace_local(text);
+                sanitize_single_line(text);
+                fprintf(stdout, "R\t%ld\tOK\t%s\n", id, text);
+                fflush(stdout);
+                free(text);
+            next_worker_req:
+                ;
             }
-            sanitize_single_line(text);
-            fprintf(stdout, "R\t%ld\tOK\t%s\n", id, text);
-            fflush(stdout);
-            free(text);
         }
         free(line);
     } else if (use_mic) {
